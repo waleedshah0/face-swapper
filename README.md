@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Face Swap Studio
 
 A self-contained website + FastAPI backend for swapping faces in **images**
@@ -199,3 +200,7 @@ each worker process gets its own copy of the cache.
   which detected face/bbox to target instead of looping over all of them.
 - **Queueing**: swap `BackgroundTasks` for Celery/RQ + Redis once you need
   more than one video worker.
+=======
+# face-swapper
+face-swapper
+>>>>>>> 8fe1b74e75f3e6b6032eb272381d6dc3f0656833
