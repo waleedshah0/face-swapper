@@ -1,0 +1,26 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+python-multipart==0.0.9
+jinja2==3.1.4
+pydantic==2.7.4
+pydantic-settings==2.3.4
+
+# Computer vision / face swap stack
+insightface==0.7.3
+# CPU build. If you add a GPU later, swap this line for:
+#   onnxruntime-gpu>=1.19.0
+onnxruntime>=1.19.0
+opencv-python-headless>=4.9.0
+numpy>=1.26.0,<2.0.0
+
+# Optional face restoration/enhancement (better quality, slower) — install
+# separately from requirements-enhancer.txt if you want it. Kept out of this
+# file because basicsr (a gfpgan dependency) has a broken setup.py on newer
+# Python and will fail the whole install otherwise. See README troubleshooting.
+
+# Video <-> audio muxing (requires the ffmpeg binary installed on the system too)
+ffmpeg-python==0.2.0
+
+# Utilities
+python-dotenv==1.0.1
+aiofiles==23.2.1

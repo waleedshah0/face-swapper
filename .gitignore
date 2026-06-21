@@ -1,0 +1,61 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Flask / app runtime
+instance/
+*.sqlite3
+*.db
+*.log
+
+# Uploaded/generated storage
+storage/
+storage/*
+models/
+models/*
+jobs/
+jobs/*
+outputs/
+outputs/*
+uploads/
+uploads/*
+
+# Media files
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Build/dist
+build/
+dist/
+*.egg-info/
+
+# Pytest cache
+.pytest_cache/
+
+# Environment variables
+.env
+.env.*
+
+# ONNX model files
+*.onnx

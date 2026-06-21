@@ -1,0 +1,14 @@
+# Optional. Install with: pip install -r requirements-enhancer.txt
+# Only needed if you set ENABLE_FACE_ENHANCER=true in .env.
+#
+# Known issue: basicsr==1.4.2's setup.py fails to build on newer Python
+# (3.12+, confirmed broken on 3.13/3.14) with "KeyError: '__version__'" —
+# it's an abandoned package, not something wrong with your setup. If you
+# hit that, either:
+#   1. Run this app's venv on Python 3.10 or 3.11 instead, where basicsr's
+#      old setup.py still works, or
+#   2. Skip the enhancer entirely — app/core/face_engine.py already runs
+#      fine without it (ENABLE_FACE_ENHANCER=false, the default).
+gfpgan==1.3.8
+basicsr==1.4.2
+facexlib==0.3.0
