@@ -201,6 +201,3 @@ each worker process gets its own copy of the cache.
 - **Queueing**: swap `BackgroundTasks` for Celery/RQ + Redis once you need
   more than one video worker.
 =======
-# face-swapper
-face-swapper
->>>>>>> 8fe1b74e75f3e6b6032eb272381d6dc3f0656833
