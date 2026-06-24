@@ -34,8 +34,12 @@ class Settings(BaseSettings):
         return p
 
     @property
+    def use_cuda(self) -> bool:
+        return self.execution_provider.lower() == "cuda"
+
+    @property
     def onnx_providers(self) -> list:
-        if self.execution_provider == "cuda":
+        if self.use_cuda:
             return ["CUDAExecutionProvider", "CPUExecutionProvider"]
         return ["CPUExecutionProvider"]
 
