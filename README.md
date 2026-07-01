@@ -44,6 +44,10 @@ If you get a GPU later: change `onnxruntime` to `onnxruntime-gpu` in
 `requirements.txt`, set `EXECUTION_PROVIDER=cuda` in `.env`, and use
 `Dockerfile.gpu` instead of `Dockerfile`.
 
+If you want to run everything on GPU, also install the optional enhancer
+requirements with `pip install -r requirements-enhancer.txt` and keep
+`ENABLE_FACE_ENHANCER=true` in `.env`.
+
 ### What to expect on CPU
 
 - **Images**: a few seconds each — perfectly usable.

@@ -59,13 +59,21 @@ def _load_face_enhancer():
     if not settings.enable_face_enhancer:
         return None
     try:
+        import torch
         from gfpgan import GFPGANer
+
+        device = "cuda" if settings.use_cuda and torch.cuda.is_available() else "cpu"
+        if settings.use_cuda and device == "cpu":
+            logger.warning(
+                "GFPGAN GPU requested but CUDA is unavailable; falling back to CPU."
+            )
 
         return GFPGANer(
             model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
             upscale=1,
             arch="clean",
             channel_multiplier=2,
+            device=device,
         )
     except Exception as exc:  # pragma: no cover - enhancer is best-effort
         logger.warning("Face enhancer unavailable, continuing without it: %s", exc)
