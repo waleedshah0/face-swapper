@@ -21,12 +21,7 @@ def is_video_filename(filename: str) -> bool:
 
 
 def safe_filename(value: str | None) -> str | None:
-    """
-    Strip any directory components from a filename pulled out of the XML
-    payload. Without this, a value like '../../etc/passwd' in OriginalSource
-    or SwapSource could escape the uploads folder — this guarantees we only
-    ever look inside settings.uploads_dir, regardless of what the XML says.
-    """
+    """Return a sanitized filename without directory traversal components."""
     if not value:
         return None
     return Path(value.strip()).name
