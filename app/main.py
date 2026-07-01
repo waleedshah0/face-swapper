@@ -1,10 +1,33 @@
 """
-FastAPI app exposing:
-  GET  /                          -> the website (Image / Video tabs)
-  POST /api/swap/image            -> synchronous image swap, returns the file
-  POST /api/swap/video             -> starts an async video swap job
-  GET  /api/jobs/{job_id}          -> poll job status/progress
-  GET  /api/jobs/{job_id}/download -> download the finished video
+FastAPI service (no frontend) exposing:
+
+  POST /api/swap
+      Body: application/xml, e.g.
+
+        <SwapRequest>
+          <TransId>12345</TransId>
+          <OriginalSource>video1.mp4</OriginalSource>
+          <SwapSource>image2.jpg</SwapSource>
+        </SwapRequest>
+
+      OriginalSource and SwapSource are filenames expected to already exist
+      in settings.uploads_dir (the shared folder the website/mobile server
+      drops files into). Whether this is an image-on-image or
+      image-on-video swap is decided purely by the extension of
+      OriginalSource.
+
+      Both paths are now fully synchronous: the request blocks until the
+      swap is completely finished and written to settings.outputs_dir, then
+      returns a small JSON confirmation (not the file itself — the calling
+      system is expected to read the actual result straight out of the
+      shared outputs folder, per the original shared-folder architecture).
+
+      There is no job/polling step any more. Important: for video, this can
+      mean the connection stays open for several minutes (much longer with
+      the face enhancer enabled — see README/troubleshooting notes). Make
+      sure whatever calls this endpoint (and any reverse proxy/load
+      balancer in front of it) is configured with a long enough timeout,
+      or this will be cut off mid-swap.
 
 Run with:  uvicorn app.main:app --reload --port 8000
 """
@@ -12,132 +35,118 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Optional
+from xml.etree import ElementTree as ET
 
-from fastapi import BackgroundTasks, FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
+from fastapi import Body, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.core.face_engine import NoFaceFoundError
 from app.core.image_swap import swap_image
 from app.core.video_swap import swap_video
-from app.jobs import create_job, get_job, update_job
-from app.schemas import JobStatus, VideoJobCreated
-from app.utils import save_upload, validate_image_upload, validate_video_upload
+from app.schemas import SwapResult
+from app.utils import (
+    IMAGE_EXTENSIONS,
+    VIDEO_EXTENSIONS,
+    is_image_filename,
+    is_video_filename,
+    safe_filename,
+    validate_image_path,
+    validate_video_path,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("faceswap.main")
 
-app = FastAPI(title="Face Swap Studio API")
-
-BASE_DIR = Path(__file__).resolve().parent.parent
-app.mount("/static", StaticFiles(directory=BASE_DIR / "static"), name="static")
-templates = Jinja2Templates(directory=BASE_DIR / "templates")
+app = FastAPI(title="Face Swap Service API")
 
 
-@app.get("/")
-async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+def _parse_swap_request(xml_body: str) -> tuple[str, str, Optional[str]]:
+    try:
+        root = ET.fromstring(xml_body)
+    except ET.ParseError as exc:
+        raise HTTPException(status_code=400, detail="Invalid XML payload.") from exc
+
+    trans_id = safe_filename(root.findtext("TransId"))
+    original_source = safe_filename(root.findtext("OriginalSource"))
+    swap_source = safe_filename(root.findtext("SwapSource"))
+
+    if not original_source:
+        raise HTTPException(status_code=400, detail="Missing OriginalSource.")
+    if not swap_source:
+        raise HTTPException(status_code=400, detail="Missing SwapSource.")
+
+    return original_source, swap_source, trans_id
 
 
-def _require_consent(consent: bool) -> None:
-    if not consent:
+# --------------------------------------------------------------------------- #
+# Single swap endpoint. Decides image-vs-video purely from the extension of
+# OriginalSource. The actual swap work runs in a thread pool (via
+# run_in_threadpool) so this long-running, CPU-bound work doesn't block the
+# server's event loop — but the HTTP response to THIS caller still only
+# comes back once the swap is fully done, same as a normal synchronous call.
+# --------------------------------------------------------------------------- #
+@app.post("/api/swap", response_model=SwapResult)
+async def api_swap(
+    xml_body: str = Body(
+        ...,
+        media_type="application/xml",
+        example="""<SwapRequest>
+  <TransId>12345</TransId>
+  <OriginalSource>video1.mp4</OriginalSource>
+  <SwapSource>image2.jpg</SwapSource>
+</SwapRequest>""",
+    ),
+):
+    original_name, swap_name, trans_id = _parse_swap_request(xml_body)
+
+    original_path = settings.uploads_dir / original_name
+    face_path = settings.uploads_dir / swap_name
+
+    if is_video_filename(original_name):
+        return await _swap_video_sync(original_path, face_path, trans_id)
+    elif is_image_filename(original_name):
+        return await _swap_image_sync(original_path, face_path, trans_id)
+    else:
+        supported = ", ".join(sorted(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS))
         raise HTTPException(
             status_code=400,
-            detail="You must confirm you have the right to use both photos before swapping.",
+            detail=f"'{original_name}' is not a supported image or video type ({supported}).",
         )
 
 
-# --------------------------------------------------------------------------- #
-# Image swap — synchronous, usually sub-second to a few seconds on a GPU
-# --------------------------------------------------------------------------- #
-@app.post("/api/swap/image")
-async def api_swap_image(
-    original_image: UploadFile,
-    face_image: UploadFile,
-    consent: bool = Form(...),
-):
-    _require_consent(consent)
-    validate_image_upload(original_image, settings.max_image_mb)
-    validate_image_upload(face_image, settings.max_image_mb)
+async def _swap_image_sync(original_path: Path, face_path: Path, trans_id: Optional[str]) -> SwapResult:
+    validate_image_path(original_path, settings.max_image_mb, label="OriginalSource")
+    validate_image_path(face_path, settings.max_image_mb, label="SwapSource")
 
-    original_path = await save_upload(original_image, settings.uploads_dir)
-    face_path = await save_upload(face_image, settings.uploads_dir)
-    output_path = settings.outputs_dir / f"{original_path.stem}_swapped.png"
+    output_stem = trans_id or original_path.stem
+    output_path = settings.outputs_dir / f"{output_stem}.png"
 
     try:
-        swap_image(original_path, face_path, output_path)
+        await run_in_threadpool(swap_image, original_path, face_path, output_path)
     except NoFaceFoundError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except Exception:
         logger.exception("Image swap failed")
         raise HTTPException(status_code=500, detail="Image swap failed. See server logs.")
 
-    return FileResponse(output_path, media_type="image/png", filename=output_path.name)
+    return SwapResult(status="success", trans_id=trans_id, media_type="image", output_file=output_path.name)
 
 
-# --------------------------------------------------------------------------- #
-# Video swap — asynchronous job, since this can take a while
-# --------------------------------------------------------------------------- #
-@app.post("/api/swap/video", response_model=VideoJobCreated)
-async def api_swap_video(
-    background_tasks: BackgroundTasks,
-    original_video: UploadFile,
-    face_image: UploadFile,
-    consent: bool = Form(...),
-):
-    _require_consent(consent)
-    validate_video_upload(original_video, settings.max_video_mb)
-    validate_image_upload(face_image, settings.max_image_mb)
+async def _swap_video_sync(original_path: Path, face_path: Path, trans_id: Optional[str]) -> SwapResult:
+    validate_video_path(original_path, settings.max_video_mb, label="OriginalSource")
+    validate_image_path(face_path, settings.max_image_mb, label="SwapSource")
 
-    original_path = await save_upload(original_video, settings.uploads_dir)
-    face_path = await save_upload(face_image, settings.uploads_dir)
+    output_stem = trans_id or original_path.stem
+    output_path = settings.outputs_dir / f"{output_stem}.mp4"
 
-    job = create_job()
-    output_path = settings.outputs_dir / f"{job.id}.mp4"
-
-    background_tasks.add_task(_run_video_job, job.id, original_path, face_path, output_path)
-    return VideoJobCreated(job_id=job.id, status=job.status)
-
-
-def _run_video_job(job_id: str, original_path: Path, face_path: Path, output_path: Path) -> None:
-    update_job(job_id, status="processing", progress=0.0)
     try:
-        def on_progress(pct: float) -> None:
-            update_job(job_id, progress=pct)
-
-        swap_video(original_path, face_path, output_path, progress_cb=on_progress)
-        update_job(job_id, status="done", progress=100.0, result_path=str(output_path))
+        await run_in_threadpool(swap_video, original_path, face_path, output_path)
     except NoFaceFoundError as exc:
-        update_job(job_id, status="failed", error=str(exc))
-    except Exception as exc:  # pragma: no cover
-        logger.exception("Video swap job %s failed", job_id)
-        update_job(job_id, status="failed", error="Video swap failed. See server logs.")
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception:
+        logger.exception("Video swap failed")
+        raise HTTPException(status_code=500, detail="Video swap failed. See server logs.")
 
-
-@app.get("/api/jobs/{job_id}", response_model=JobStatus)
-async def api_job_status(job_id: str):
-    job = get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found.")
-
-    download_url = f"/api/jobs/{job_id}/download" if job.status == "done" else None
-    return JobStatus(
-        job_id=job.id,
-        status=job.status,
-        progress=job.progress,
-        error=job.error,
-        download_url=download_url,
-    )
-
-
-@app.get("/api/jobs/{job_id}/download")
-async def api_job_download(job_id: str):
-    job = get_job(job_id)
-    if job is None:
-        raise HTTPException(status_code=404, detail="Job not found.")
-    if job.status != "done" or not job.result_path:
-        raise HTTPException(status_code=409, detail=f"Job is not finished yet (status: {job.status}).")
-
-    return FileResponse(job.result_path, media_type="video/mp4", filename=Path(job.result_path).name)
+    return SwapResult(status="success", trans_id=trans_id, media_type="video", output_file=output_path.name)
