@@ -37,8 +37,12 @@ class NoFaceFoundError(Exception):
 def _load_face_analyser():
     import insightface
 
-    analyser = insightface.app.FaceAnalysis(name="buffalo_l", providers=settings.onnx_providers)
-    analyser.prepare(ctx_id=0, det_size=(640, 640))
+    analyser = insightface.app.FaceAnalysis(
+        name=settings.face_analyser_name,
+        providers=settings.onnx_providers,
+    )
+    detector_size = settings.face_detector_size
+    analyser.prepare(ctx_id=0, det_size=(detector_size, detector_size))
     return analyser
 
 
