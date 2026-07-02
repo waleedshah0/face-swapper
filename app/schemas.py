@@ -10,5 +10,14 @@ class SwapResult(BaseModel):
     output_file: str                # filename written into settings.outputs_dir
 
 
+class SwapValidationResponse(BaseModel):
+    status: str
+    message: str
+    trans_id: Optional[str] = None
+    original_source: Optional[str] = None
+    swap_source: Optional[str] = None
+    uploads_dir: Optional[str] = None
+
+
 class ErrorResponse(BaseModel):
     detail: str
