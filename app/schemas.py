@@ -3,11 +3,29 @@ from typing import Optional
 from pydantic import BaseModel
 
 
-class SwapResult(BaseModel):
-    status: str                     # "success"
-    trans_id: Optional[str] = None
+class SwapAccepted(BaseModel):
+    """Returned immediately by POST /api/swap once the job has been queued in RabbitMQ."""
+
+    job_id: str                     # server-generated; the id everything else is tracked under
     media_type: str                 # "image" or "video"
-    output_file: str                # filename written into settings.outputs_dir
+    status: str                     # "Starting"
+
+
+class SwapStatus(BaseModel):
+    """
+    A snapshot of one job's state, as stored in Redis and returned by
+    GET /api/swap/{job_id}.
+    """
+
+    job_id: str
+    original_source: str
+    swap_source: str
+    media_type: str
+    status: str                     # "Starting" | "In progress" | "Completed" | "Failed"
+    message: Optional[str] = None
+    output_file: Optional[str] = None
+    created_at: str
+    updated_at: str
 
 
 class ErrorResponse(BaseModel):
