@@ -1,0 +1,39 @@
+# Secrets / local config — pass at container-start time instead (see Dockerfile)
+.env
+.env.*
+!.env.example
+
+# VCS
+.git
+.gitignore
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.python-version
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv/
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Local runtime data — mounted as volumes at runtime, not baked into the image
+storage/uploads/*
+storage/outputs/*
+storage/jobs/*
+!storage/**/.gitkeep
+
+# Docs / misc
+README.md
+*.md
+.pytest_cache/

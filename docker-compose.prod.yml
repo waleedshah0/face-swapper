@@ -1,0 +1,102 @@
+# Server deployment: pulls your pushed image (no repo checkout, no build
+# needed on the server) and runs all 4 pieces — RabbitMQ, Redis, the API,
+# and the GPU worker.
+#
+# On the server:
+#   1. Copy this file and a server .env (see README "Deploying to a server")
+#      into a directory, e.g. /opt/faceswap-app/
+#   2. docker pull dev1shayansolutions/faceswapper:v1
+#   3. docker compose -f docker-compose.prod.yml up -d
+#   4. docker compose -f docker-compose.prod.yml up -d --scale worker=3   # optional, more throughput
+#
+# To roll out a new image version: docker build/push a new tag, update the
+# `image:` lines below (or pass IMAGE_TAG via a .env entry), then
+# `docker compose -f docker-compose.prod.yml pull && docker compose -f docker-compose.prod.yml up -d`.
+
+services:
+  rabbitmq:
+    image: rabbitmq:3.13-management
+    restart: unless-stopped
+    ports:
+      # Bound to localhost only — containers reach RabbitMQ over the compose
+      # network by service name regardless. Only open this to 0.0.0.0 (or
+      # tunnel in via SSH) if you specifically need external access to the
+      # management UI, and change the default guest/guest credentials first.
+      - "127.0.0.1:5672:5672"
+      - "127.0.0.1:15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - redis_data:/data
+
+  api:
+    image: dev1shayansolutions/faceswapper:v1
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Override whatever's in .env so the API always talks to the compose
+      # network's rabbitmq/redis services, not localhost.
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      REDIS_URL: redis://redis:6379/0
+    ports:
+      - "8000:8000"
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      # Same shared-folder paths your old `docker run` command used — keep
+      # UPLOADS_DIR/OUTPUTS_DIR in .env pointed at these same paths.
+      - /mnt/gpu/send_to_gpu:/mnt/gpu/send_to_gpu
+      - /mnt/gpu/receive_from_gpu:/mnt/gpu/receive_from_gpu
+    # No GPU here on purpose: app/main.py only validates requests and talks
+    # to RabbitMQ/Redis — it never imports the swap pipeline, so it never
+    # touches the GPU. Only the worker needs one.
+
+  worker:
+    image: dev1shayansolutions/faceswapper:v1
+    restart: unless-stopped
+    command: ["python3", "-m", "app.worker"]
+    env_file: .env
+    environment:
+      RABBITMQ_URL: amqp://guest:guest@rabbitmq:5672/%2F
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      rabbitmq:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - /mnt/gpu/send_to_gpu:/mnt/gpu/send_to_gpu
+      - /mnt/gpu/receive_from_gpu:/mnt/gpu/receive_from_gpu
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # Scale for more throughput: --scale worker=3 above. Each replica
+    # requests the same GPU reservation; on a single-GPU box they'll share
+    # it concurrently rather than each getting a dedicated GPU.
+
+volumes:
+  rabbitmq_data:
+  redis_data:
