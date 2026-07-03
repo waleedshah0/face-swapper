@@ -1,35 +1,51 @@
-<<<<<<< HEAD
 # Face Swap Studio
 
-A self-contained website + FastAPI backend for swapping faces in **images**
-and **videos**, built around InsightFace's `inswapper_128` model (the
-one-shot face-swap model used under the hood by most production face-swap
-tools, including the open-source FaceFusion project).
+A backend-only FastAPI service for swapping faces in **images** and
+**videos**, built around InsightFace's `inswapper_128` model (the one-shot
+face-swap model used under the hood by most production face-swap tools,
+including the open-source FaceFusion project).
+
+There is no frontend here — the caller is another backend system (a
+website/mobile server) that has already dropped the source files into a
+shared uploads folder and just needs the swap done.
 
 ```
-Browser  ──────►  FastAPI (app/main.py)
-  upload                │
-  original + face        ├─ /api/swap/image   → sync, returns the swapped image
-                         └─ /api/swap/video   → starts a background job, poll for status
-                                                      │
-                                              app/core/face_engine.py
-                                              (InsightFace detector + inswapper_128)
-                                                      │
-                                              app/core/image_swap.py
-                                              app/core/video_swap.py (frame loop + ffmpeg audio mux)
+Caller (website/mobile server)
+   │  POST /api/swap  (XML: OriginalSource, SwapSource)
+   ▼
+FastAPI (app/main.py)
+   │  validate payload → generate job_id → write status "Starting" to Redis → publish job to RabbitMQ
+   │  responds 202 immediately with {job_id, media_type, status}
+   ▼
+RabbitMQ (swap_jobs queue)
+   ▼
+Worker process(es) (app/worker.py) — one or more, scale horizontally
+   │  status → "In progress" (message updated with rough % complete for video)
+   │  app/core/face_engine.py   (InsightFace detector + inswapper_128)
+   │  app/core/image_swap.py / app/core/video_swap.py (frame loop + ffmpeg audio mux)
+   │  status → "Completed" (+ output_file) or "Failed" (+ message)
+   ▼
+Redis (status cache, keyed by job_id)
+   ▲
+   │  GET /api/swap/{job_id}  (one-shot snapshot — call again to see the next update)
+Caller
 ```
 
-This is a single-process reference implementation. If you want to split it
-into the 4-step architecture you described earlier (web server / GPU server
-talking through a shared folder), `app/core/*` is the part that runs on the
-GPU box — `image_swap.swap_image()` and `video_swap.swap_video()` are the
-two functions a GPU-side worker would call after picking files up from the
-shared folder, before writing the result back and notifying the web server.
+Why a queue at all: a single swap can take anywhere from under a second
+(image, GPU) to several minutes (video, CPU). Handling requests inline would
+mean one slow video ties up a request thread while every other caller waits.
+RabbitMQ decouples "accept the request" from "do the work," and lets you run
+as many worker processes as you have CPU/GPU capacity for, independently of
+how many API requests are coming in.
 
 ## 1. Install system dependencies
 
 - Python 3.10+
-- **ffmpeg** on your PATH (`apt install ffmpeg` / `brew install ffmpeg` / on Windows, [download a build](https://www.gyan.dev/ffmpeg/builds/) and add it to PATH) — required for video audio muxing
+- **ffmpeg** on your PATH (`apt install ffmpeg` / `brew install ffmpeg` / on
+  Windows, [download a build](https://www.gyan.dev/ffmpeg/builds/) and add
+  it to PATH) — required for video audio muxing
+- **RabbitMQ** and **Redis** — either run them yourself, or use the included
+  `docker-compose.yml` (see step 5)
 
 This project runs CPU-only by default — no GPU required to get started.
 
@@ -64,7 +80,7 @@ requirements with `pip install -r requirements-enhancer.txt` and keep
   - If video volume becomes real (not just testing), that's the point to
     rent GPU time (a cloud GPU instance, or a local card) rather than scale
     CPU workers — a single mid-range GPU will outrun a large CPU fleet for
-    this workload.
+    this workload, and run more `app/worker.py` processes in the meantime.
 
 ## 3. Get the model weights
 
@@ -90,47 +106,96 @@ GFPGAN weights then download automatically on first run.
 
 ```bash
 cp .env.example .env
-# edit .env: execution provider, model path, upload size limits, etc.
+# edit .env: execution provider, model path, upload size limits,
+# RABBITMQ_URL, REDIS_URL, etc.
 ```
+
+`RABBITMQ_URL` and `REDIS_URL` default to `localhost` — correct if you're
+running RabbitMQ/Redis directly on your machine. `docker-compose.yml`
+overrides both to point at its own `rabbitmq`/`redis` service containers, so
+you don't need to touch `.env` if you're using it.
 
 ## 5. Run
 
+**Option A — docker-compose (recommended, brings up everything):**
+
 ```bash
-uvicorn app.main:app --reload --port 8000
+docker compose up --build
+# scale workers for more swap throughput, e.g.:
+docker compose up --build --scale worker=3
 ```
 
-Open `http://localhost:8000` — you'll see two tabs, **Image** and **Video**.
-Each lets you upload an original + a face photo and run the swap.
+This starts RabbitMQ (with its management UI at `http://localhost:15672`,
+guest/guest), Redis, the API (`http://localhost:8000`), and one worker.
+
+**Option B — run each piece yourself:**
+
+```bash
+# terminal 1: RabbitMQ + Redis need to be running and reachable at RABBITMQ_URL / REDIS_URL
+# terminal 2:
+uvicorn app.main:app --reload --port 8000
+# terminal 3 (one or more):
+python -m app.worker
+```
 
 ## API reference
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/api/swap/image` | multipart: `original_image`, `face_image`, `consent` | Returns the swapped PNG directly |
-| POST | `/api/swap/video` | multipart: `original_video`, `face_image`, `consent` | Returns `{job_id, status}` immediately |
-| GET | `/api/jobs/{job_id}` | — | Returns `{status, progress, download_url}` |
-| GET | `/api/jobs/{job_id}/download` | — | Streams the finished MP4 |
+| POST | `/api/swap` | `application/xml`: `<SwapRequest><OriginalSource/><SwapSource/></SwapRequest>` | Validates the payload, generates a `job_id`, queues the job, returns `202` with `{job_id, media_type, status}` immediately. Does not wait for the swap to finish. |
+| GET | `/api/swap/{job_id}` | — | Returns the job's current status as a single JSON response and closes immediately. Not a stream — poll it again whenever you want the next update. |
 
-Why video is async and image isn't: image swap is a single inference call
-(sub-second to a couple seconds on GPU). Video is hundreds/thousands of
-per-frame inference calls plus an ffmpeg mux step, so it runs as a
-background task and the frontend polls for progress instead of blocking
-the HTTP request.
+`OriginalSource` and `SwapSource` are filenames expected to already exist in
+`settings.uploads_dir` (the shared folder the website/mobile server drops
+files into). Whether this is an image-on-image or image-on-video swap is
+decided purely by the extension of `OriginalSource`.
+
+`job_id` is generated server-side in the `POST /api/swap` response — it's
+the *only* identifier for a job, there's no caller-supplied id in the
+request. Hang on to the `job_id` you get back to check status later. Because
+there's no caller-supplied id to de-duplicate against, every `POST
+/api/swap` call queues a brand new job, including if you resend the same
+`OriginalSource`/`SwapSource` — retry logic on the caller's side needs to
+account for that (e.g. don't blindly retry on timeout without checking
+whether the first request actually landed).
+
+Job status is one of `Starting` (queued, not yet picked up), `In progress`
+(a worker is running the swap — for video jobs, `message` carries a rough
+`"NN% complete"` that updates roughly every 5%), `Completed` (`output_file`
+is set — the result is in `settings.outputs_dir`), or `Failed` (`message`
+explains why).
+
+Example (`curl`):
+
+```bash
+curl -X POST http://localhost:8000/api/swap \
+  -H "Content-Type: application/xml" \
+  -d '<SwapRequest><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource></SwapRequest>'
+# -> {"job_id": "...", "media_type": "video", "status": "Starting"}
+
+curl http://localhost:8000/api/swap/<job_id-from-above>
+```
+
+Call the `GET` again a few seconds later to see the next update — this is
+plain request/response, not a held-open connection, so a standard HTTP
+client (or Swagger's "Try it out") works fine, unlike a Server-Sent Events
+or WebSocket stream would.
 
 ## Performance / scaling notes
 
-- **Model loading is lazy and cached** (`app/core/face_engine.py`) — the
-  first request after server start pays the model-load cost, every request
-  after that reuses the already-loaded model in memory.
+- **Model loading is lazy and cached per worker process**
+  (`app/core/face_engine.py`) — the first job a given worker picks up pays
+  the model-load cost, every job after that in the same process reuses the
+  already-loaded model in memory.
 - **Video is the bottleneck.** Each frame runs through detection + swap.
   For long videos, consider: processing on a frame-skip + interpolation
-  schedule, running multiple GPU workers behind a queue (Redis/RQ or
-  Celery) instead of in-process `BackgroundTasks`, or capping max video
-  length/resolution on upload.
-- The in-memory job store (`app/jobs.py`) is fine for one process. For
-  multiple workers or servers, replace it with Redis or a database table —
-  the `create_job/get_job/update_job` interface is intentionally tiny so
-  that's a drop-in swap.
+  schedule, capping max video length/resolution on upload, or simply
+  running more `app/worker.py` processes (`docker compose up --scale
+  worker=N`) — RabbitMQ round-robins jobs across however many workers are
+  consuming the queue, so this is the main lever for throughput.
+- The status cache (`app/store.py`) is Redis, shared between the API and
+  every worker process/machine, with a TTL (`REQUEST_RECORD_TTL_SECONDS`)
+  so old job records don't accumulate forever.
 - `inswapper_128` is a **one-shot** model — no per-face-pair training step,
   which is what makes it suitable for an on-demand public-facing service
   (compare to DeepFaceLab, which needs hours of training per face pair and
@@ -138,14 +203,11 @@ the HTTP request.
 
 ## Responsible use
 
-- The consent checkbox in both forms is enforced server-side
-  (`_require_consent` in `app/main.py`) — requests without it are rejected
-  with a 400.
-- Consider adding, depending on your jurisdiction and audience: visible
-  watermarking of outputs, content moderation on uploads, rate limiting,
-  and logging/audit trails. Non-consensual use of this kind of tool carries
-  real legal exposure in a growing number of jurisdictions (e.g. the U.S.
-  TAKE IT DOWN Act) — worth a compliance review before launch, not after.
+Consider adding, depending on your jurisdiction and audience: visible
+watermarking of outputs, content moderation on uploads, rate limiting, and
+logging/audit trails. Non-consensual use of this kind of tool carries real
+legal exposure in a growing number of jurisdictions (e.g. the U.S. TAKE IT
+DOWN Act) — worth a compliance review before launch, not after.
 
 ## Troubleshooting
 
@@ -185,11 +247,17 @@ working without enhancement. To actually fix it: either install an older
 `torchvision` (`pip install "torchvision<0.17"`) in the same environment,
 or set `ENABLE_FACE_ENHANCER=false` in `.env` and skip it entirely.
 
-**Model load is slow on every request, not just the first one**
+**Model load is slow on every job, not just the first one**
 That means something is re-creating the `FaceAnalysis`/swapper objects
-instead of reusing the cached ones in `face_engine.py` — check you're
-running a single `uvicorn` worker (`--workers 1`) during testing, since
-each worker process gets its own copy of the cache.
+instead of reusing the cached ones in `face_engine.py` — check you're not
+restarting the worker process between jobs; each new worker process pays
+the load cost once, on its first job.
+
+**Jobs stay stuck on "Starting"**
+Means nothing is consuming the queue — check `app/worker.py` is actually
+running and connected to the same `RABBITMQ_URL` as the API. The RabbitMQ
+management UI (`http://localhost:15672` with docker-compose) shows queue
+depth and connected consumers, which is the fastest way to confirm.
 
 ## Extending this
 
@@ -202,6 +270,17 @@ each worker process gets its own copy of the cache.
   every detected face with the one supplied face. If you need "swap only
   the 2nd person from the left," that's a matter of letting the user pick
   which detected face/bbox to target instead of looping over all of them.
-- **Queueing**: swap `BackgroundTasks` for Celery/RQ + Redis once you need
-  more than one video worker.
-=======
+- **Dead-lettering**: `app/worker.py` currently acks every message after
+  processing, even on failure, and records the failure reason in Redis
+  rather than requeuing. If you want RabbitMQ itself to distinguish
+  "bad input, don't retry" from "infra hiccup, retry a few times," wire up
+  a dead-letter exchange and have the worker `basic_nack` on infra-type
+  errors specifically.
+- **Push instead of poll**: if you'd rather not poll `GET /api/swap/{job_id}`,
+  the natural next step is a webhook — add a `CallbackUrl` to `SwapRequest`
+  and have `app/worker.py` POST status updates to it as they happen.
+- **Caller-supplied idempotency key**: if you need retry-safe de-duplication
+  again (e.g. a caller-supplied `TransId` that maps to a `job_id`), that's a
+  small addition on top of the current job_id-only design — add the field
+  back to `SwapRequest`, and look it up in Redis before generating a new
+  `job_id` in `app/main.py`.

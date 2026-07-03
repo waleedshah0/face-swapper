@@ -28,12 +28,30 @@ class Settings(BaseSettings):
     face_analyser_name: str = Field(default="buffalo_l", alias="FACE_ANALYSER_NAME")
     face_detector_size: int = Field(default=640, alias="FACE_DETECTOR_SIZE")
 
+    # RabbitMQ: swap jobs are published here after payload validation and
+    # picked up by app/worker.py, which does the actual (slow) swap work.
+    rabbitmq_url: str = Field(default="amqp://guest:guest@localhost:5672/%2F", alias="RABBITMQ_URL")
+    rabbitmq_swap_queue: str = Field(default="swap_jobs", alias="RABBITMQ_SWAP_QUEUE")
+    rabbitmq_prefetch_count: int = Field(default=1, alias="RABBITMQ_PREFETCH_COUNT")
+
+    # Redis: shared status cache. The API writes "Starting" when a job is
+    # enqueued; the worker updates it to "In progress" / "Completed" /
+    # "Failed" as it processes the job. The SSE stream endpoint reads it.
+    redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
+    request_record_ttl_seconds: int = Field(default=86400, alias="REQUEST_RECORD_TTL_SECONDS")
+
     @field_validator("execution_provider")
     @classmethod
     def normalize_execution_provider(cls, value: str) -> str:
         return value.strip().lower()
 
-    @field_validator("max_image_mb", "max_video_mb", "face_detector_size")
+    @field_validator(
+        "max_image_mb",
+        "max_video_mb",
+        "face_detector_size",
+        "rabbitmq_prefetch_count",
+        "request_record_ttl_seconds",
+    )
     @classmethod
     def validate_positive_int(cls, value: int) -> int:
         if value <= 0:

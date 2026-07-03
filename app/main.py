@@ -5,7 +5,6 @@ FastAPI service (no frontend) exposing:
       Body: application/xml, e.g.
 
         <SwapRequest>
-          <TransId>12345</TransId>
           <OriginalSource>video1.mp4</OriginalSource>
           <SwapSource>image2.jpg</SwapSource>
         </SwapRequest>
@@ -16,36 +15,47 @@ FastAPI service (no frontend) exposing:
       image-on-video swap is decided purely by the extension of
       OriginalSource.
 
-      Both paths are now fully synchronous: the request blocks until the
-      swap is completely finished and written to settings.outputs_dir, then
-      returns a small JSON confirmation (not the file itself — the calling
-      system is expected to read the actual result straight out of the
-      shared outputs folder, per the original shared-folder architecture).
+      This endpoint only validates the request and hands the actual swap
+      off to a queue — it does not perform the swap itself. Once
+      OriginalSource and SwapSource have been validated (files exist, are
+      the right type, and are within the configured size limits), a job_id
+      is generated, a status record is written to Redis under it with
+      status "Starting", and a job message is published to RabbitMQ (see
+      app/broker.py). The response comes back immediately (202 Accepted)
+      with job_id — it does not wait for the swap to finish. job_id is the
+      only identifier for the job; there is no caller-supplied id, so the
+      caller must hang on to the job_id from the response to check status
+      later, and each POST always creates a brand new job (no de-dup).
 
-      There is no job/polling step any more. Important: for video, this can
-      mean the connection stays open for several minutes (much longer with
-      the face enhancer enabled — see README/troubleshooting notes). Make
-      sure whatever calls this endpoint (and any reverse proxy/load
-      balancer in front of it) is configured with a long enough timeout,
-      or this will be cut off mid-swap.
+      app/worker.py is the separate, long-running process that actually
+      consumes jobs off the queue, runs the swap, and updates the job's
+      status in Redis ("In progress" -> "Completed"/"Failed"). For video
+      jobs, it also updates the message field with rough percent-complete
+      as it goes (see app/worker.py's progress callback).
 
-Run with:  uvicorn app.main:app --reload --port 8000
+  GET /api/swap/{job_id}
+      Returns the job's current status as a single JSON response and
+      closes immediately — a plain snapshot, not a stream. Poll this as
+      often as you like to watch a job's progress.
+
+Run the API with:     uvicorn app.main:app --reload --port 8000
+Run the worker with:  python -m app.worker
 """
 from __future__ import annotations
 
 import logging
+import uuid
+from dataclasses import asdict
 from pathlib import Path
-from typing import Optional
 from xml.etree import ElementTree as ET
 
 from fastapi import Body, FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 
+from app.broker import BrokerError, SwapJobMessage, publish_swap_job
 from app.config import settings
-from app.core.face_engine import NoFaceFoundError
-from app.core.image_swap import swap_image
-from app.core.video_swap import swap_video
-from app.schemas import SwapResult
+from app.schemas import SwapAccepted, SwapStatus
+from app.store import STATUS_STARTING, RequestStoreError, get_store
 from app.utils import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -62,13 +72,19 @@ logger = logging.getLogger("faceswap.main")
 app = FastAPI(title="Face Swap Service API")
 
 
-def _parse_swap_request(xml_body: str) -> tuple[str, str, Optional[str]]:
+def _parse_swap_request(xml_body: str) -> tuple[str, str]:
+    """Parse and sanity-check the XML payload. Returns (original_source, swap_source)."""
     try:
         root = ET.fromstring(xml_body)
     except ET.ParseError as exc:
         raise HTTPException(status_code=400, detail="Invalid XML payload.") from exc
 
-    trans_id = safe_filename(root.findtext("TransId"))
+    if root.tag != "SwapRequest":
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid XML payload. Root element must be <SwapRequest>.",
+        )
+
     original_source = safe_filename(root.findtext("OriginalSource"))
     swap_source = safe_filename(root.findtext("SwapSource"))
 
@@ -77,76 +93,103 @@ def _parse_swap_request(xml_body: str) -> tuple[str, str, Optional[str]]:
     if not swap_source:
         raise HTTPException(status_code=400, detail="Missing SwapSource.")
 
-    return original_source, swap_source, trans_id
+    return original_source, swap_source
+
+
+def _resolve_upload_path(filename: str, label: str) -> Path:
+    path = settings.uploads_dir / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail=f"{label} not found in uploads folder: {filename}")
+    return path
+
+
+def _media_type_for(original_name: str) -> str:
+    if is_video_filename(original_name):
+        return "video"
+    if is_image_filename(original_name):
+        return "image"
+    supported = ", ".join(sorted(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS))
+    raise HTTPException(
+        status_code=400,
+        detail=f"'{original_name}' is not a supported image or video type ({supported}).",
+    )
+
+
+def _validate_sources(original_path: Path, face_path: Path, media_type: str) -> None:
+    if media_type == "video":
+        validate_video_path(original_path, settings.max_video_mb, label="OriginalSource")
+    else:
+        validate_image_path(original_path, settings.max_image_mb, label="OriginalSource")
+    validate_image_path(face_path, settings.max_image_mb, label="SwapSource")
 
 
 # --------------------------------------------------------------------------- #
-# Single swap endpoint. Decides image-vs-video purely from the extension of
-# OriginalSource. The actual swap work runs in a thread pool (via
-# run_in_threadpool) so this long-running, CPU-bound work doesn't block the
-# server's event loop — but the HTTP response to THIS caller still only
-# comes back once the swap is fully done, same as a normal synchronous call.
+# POST /api/swap — validate the payload, enqueue the job, return immediately.
+# The actual swap happens in app/worker.py.
 # --------------------------------------------------------------------------- #
-@app.post("/api/swap", response_model=SwapResult)
+@app.post("/api/swap", response_model=SwapAccepted, status_code=202)
 async def api_swap(
     xml_body: str = Body(
         ...,
         media_type="application/xml",
         example="""<SwapRequest>
-  <TransId>12345</TransId>
   <OriginalSource>video1.mp4</OriginalSource>
   <SwapSource>image2.jpg</SwapSource>
 </SwapRequest>""",
     ),
 ):
-    original_name, swap_name, trans_id = _parse_swap_request(xml_body)
+    original_name, swap_name = _parse_swap_request(xml_body)
+    media_type = _media_type_for(original_name)
 
-    original_path = settings.uploads_dir / original_name
-    face_path = settings.uploads_dir / swap_name
+    original_path = _resolve_upload_path(original_name, "OriginalSource")
+    face_path = _resolve_upload_path(swap_name, "SwapSource")
+    _validate_sources(original_path, face_path, media_type)
 
-    if is_video_filename(original_name):
-        return await _swap_video_sync(original_path, face_path, trans_id)
-    elif is_image_filename(original_name):
-        return await _swap_image_sync(original_path, face_path, trans_id)
-    else:
-        supported = ", ".join(sorted(IMAGE_EXTENSIONS | VIDEO_EXTENSIONS))
-        raise HTTPException(
-            status_code=400,
-            detail=f"'{original_name}' is not a supported image or video type ({supported}).",
+    job_id = str(uuid.uuid4())
+    store = get_store()
+
+    try:
+        await run_in_threadpool(store.create, job_id, original_name, swap_name, media_type)
+    except RequestStoreError as exc:
+        logger.exception("Status cache unavailable")
+        raise HTTPException(status_code=503, detail="Status cache unavailable. Try again shortly.") from exc
+
+    job_message = SwapJobMessage(
+        job_id=job_id,
+        original_source=original_name,
+        swap_source=swap_name,
+        media_type=media_type,
+    )
+    try:
+        await run_in_threadpool(publish_swap_job, job_message)
+    except BrokerError as exc:
+        logger.exception("Failed to publish swap job to RabbitMQ")
+        # The status record already says "Starting" but nothing was actually
+        # queued — correct it so a status check doesn't look like a real job
+        # is in flight when nothing was.
+        await run_in_threadpool(
+            store.update_status, job_id, "Failed", f"Could not queue job: {exc}"
         )
+        raise HTTPException(status_code=503, detail="Could not queue swap job. Try again shortly.") from exc
+
+    return SwapAccepted(job_id=job_id, media_type=media_type, status=STATUS_STARTING)
 
 
-async def _swap_image_sync(original_path: Path, face_path: Path, trans_id: Optional[str]) -> SwapResult:
-    validate_image_path(original_path, settings.max_image_mb, label="OriginalSource")
-    validate_image_path(face_path, settings.max_image_mb, label="SwapSource")
-
-    output_stem = trans_id or original_path.stem
-    output_path = settings.outputs_dir / f"{output_stem}.png"
-
+# --------------------------------------------------------------------------- #
+# GET /api/swap/{job_id} — one-shot status snapshot. Returns immediately
+# with whatever is currently in Redis and closes; call it again to see the
+# next update (e.g. video jobs' message field advances roughly every 5%).
+# --------------------------------------------------------------------------- #
+@app.get("/api/swap/{job_id}", response_model=SwapStatus)
+async def get_swap_status(job_id: str):
+    store = get_store()
     try:
-        await run_in_threadpool(swap_image, original_path, face_path, output_path)
-    except NoFaceFoundError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except Exception:
-        logger.exception("Image swap failed")
-        raise HTTPException(status_code=500, detail="Image swap failed. See server logs.")
+        record = await run_in_threadpool(store.get, job_id)
+    except RequestStoreError as exc:
+        logger.exception("Status cache unavailable")
+        raise HTTPException(status_code=503, detail="Status cache unavailable. Try again shortly.") from exc
 
-    return SwapResult(status="success", trans_id=trans_id, media_type="image", output_file=output_path.name)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f"Unknown job_id: {job_id}")
 
-
-async def _swap_video_sync(original_path: Path, face_path: Path, trans_id: Optional[str]) -> SwapResult:
-    validate_video_path(original_path, settings.max_video_mb, label="OriginalSource")
-    validate_image_path(face_path, settings.max_image_mb, label="SwapSource")
-
-    output_stem = trans_id or original_path.stem
-    output_path = settings.outputs_dir / f"{output_stem}.mp4"
-
-    try:
-        await run_in_threadpool(swap_video, original_path, face_path, output_path)
-    except NoFaceFoundError as exc:
-        raise HTTPException(status_code=422, detail=str(exc))
-    except Exception:
-        logger.exception("Video swap failed")
-        raise HTTPException(status_code=500, detail="Video swap failed. See server logs.")
-
-    return SwapResult(status="success", trans_id=trans_id, media_type="video", output_file=output_path.name)
+    return SwapStatus(**asdict(record))
