@@ -38,6 +38,10 @@ RabbitMQ decouples "accept the request" from "do the work," and lets you run
 as many worker processes as you have CPU/GPU capacity for, independently of
 how many API requests are coming in.
 
+Note the API container never touches the GPU: `app/main.py` only validates
+requests and talks to RabbitMQ/Redis, it never imports the swap pipeline.
+Only `app/worker.py` needs GPU access — see "Deploying to a server" below.
+
 ## 1. Install system dependencies
 
 - Python 3.10+
@@ -58,7 +62,7 @@ pip install -r requirements.txt
 
 If you get a GPU later: change `onnxruntime` to `onnxruntime-gpu` in
 `requirements.txt`, set `EXECUTION_PROVIDER=cuda` in `.env`, and use
-`Dockerfile.gpu` instead of `Dockerfile`.
+`Dockerfile.gpu` instead of `Dockerfile` (or see "Deploying to a server").
 
 If you want to run everything on GPU, also install the optional enhancer
 requirements with `pip install -r requirements-enhancer.txt` and keep
@@ -137,6 +141,68 @@ uvicorn app.main:app --reload --port 8000
 # terminal 3 (one or more):
 python -m app.worker
 ```
+
+## Deploying to a server (GPU)
+
+The image is built once and used for **both** the API and the worker — the
+worker's `command:` is just overridden to run `python -m app.worker`
+instead of `uvicorn`. Only the worker needs `--gpus`.
+
+**1. Build and push (same as before):**
+
+```bash
+docker build -t dev1shayansolutions/faceswapper:v1 .
+docker push dev1shayansolutions/faceswapper:v1
+```
+
+**2. On the server**, create a directory (e.g. `/opt/faceswap-app/`) with
+two files — you don't need to check out the repo on the server at all:
+
+- `docker-compose.prod.yml` (copy from this repo)
+- `.env`, based on `.env.example` plus:
+
+  ```bash
+  EXECUTION_PROVIDER=cuda
+  UPLOADS_DIR=/mnt/gpu/send_to_gpu
+  OUTPUTS_DIR=/mnt/gpu/receive_from_gpu
+  # RABBITMQ_URL / REDIS_URL are overridden by docker-compose.prod.yml
+  # to point at the rabbitmq/redis services — no need to set them here.
+  ```
+
+  `.env` is **not** baked into the image (see `.dockerignore`) — it's read
+  by each container at start time via `env_file:` in
+  `docker-compose.prod.yml`, so changing settings later is just an edit +
+  restart, not a rebuild.
+
+**3. Pull and start everything:**
+
+```bash
+docker pull dev1shayansolutions/faceswapper:v1
+docker compose -f docker-compose.prod.yml up -d
+# more worker throughput:
+docker compose -f docker-compose.prod.yml up -d --scale worker=3
+```
+
+This replaces the old single-container `docker run --gpus all ...` command
+— `docker-compose.prod.yml` starts RabbitMQ, Redis, the API (on `:8000`,
+no GPU), and the worker (with `--gpus`) together, wired to talk to each
+other, with the same `/mnt/gpu/send_to_gpu` / `/mnt/gpu/receive_from_gpu`
+bind mounts your old command used.
+
+**Rolling out a new version:** build + push a new tag as before, then on
+the server:
+
+```bash
+docker compose -f docker-compose.prod.yml pull
+docker compose -f docker-compose.prod.yml up -d
+```
+
+**Security note:** `docker-compose.prod.yml` binds RabbitMQ's and Redis's
+ports to `127.0.0.1` only (containers still reach each other over the
+compose network by service name) — only the API's `:8000` is open
+externally. If you need the RabbitMQ management UI from outside the
+server, tunnel in over SSH rather than exposing `15672` publicly, and
+consider changing the default `guest`/`guest` credentials.
 
 ## API reference
 
@@ -258,6 +324,14 @@ Means nothing is consuming the queue — check `app/worker.py` is actually
 running and connected to the same `RABBITMQ_URL` as the API. The RabbitMQ
 management UI (`http://localhost:15672` with docker-compose) shows queue
 depth and connected consumers, which is the fastest way to confirm.
+
+**Worker connects then immediately gets disconnected (`IncompatibleProtocolError` / EOF during handshake)**
+Usually a startup race, not a real failure: RabbitMQ's TCP port can start
+accepting connections a moment before its AMQP listener is fully ready
+(especially noticeable through Docker Desktop's Windows/WSL2 port
+forwarding). Confirm with `docker compose ps` (should show `healthy`) and
+`docker compose logs rabbitmq` (look for `Server startup complete`), then
+just retry starting the worker.
 
 ## Extending this
 
