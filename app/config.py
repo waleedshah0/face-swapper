@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     face_analyser_name: str = Field(default="buffalo_l", alias="FACE_ANALYSER_NAME")
     face_detector_size: int = Field(default=640, alias="FACE_DETECTOR_SIZE")
 
+    # Cosine-similarity threshold for deciding a detected face matches the
+    # TargetSource reference photo (same person) rather than a bystander.
+    # See app/core/face_engine.py:select_target_face(). Raise it if the
+    # wrong face gets picked; lower it if the right face is being missed.
+    face_match_threshold: float = Field(default=0.35, alias="FACE_MATCH_THRESHOLD")
+
     # RabbitMQ: swap jobs are published here after payload validation and
     # picked up by app/worker.py, which does the actual (slow) swap work.
     rabbitmq_url: str = Field(default="amqp://guest:guest@localhost:5672/%2F", alias="RABBITMQ_URL")
@@ -36,7 +42,7 @@ class Settings(BaseSettings):
 
     # Redis: shared status cache. The API writes "Starting" when a job is
     # enqueued; the worker updates it to "In progress" / "Completed" /
-    # "Failed" as it processes the job. The SSE stream endpoint reads it.
+    # "Failed" as it processes the job. GET /api/swap/{job_id} reads it.
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     request_record_ttl_seconds: int = Field(default=86400, alias="REQUEST_RECORD_TTL_SECONDS")
 
@@ -56,6 +62,13 @@ class Settings(BaseSettings):
     def validate_positive_int(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("Value must be greater than 0")
+        return value
+
+    @field_validator("face_match_threshold")
+    @classmethod
+    def validate_face_match_threshold(cls, value: float) -> float:
+        if not (0.0 < value < 1.0):
+            raise ValueError("FACE_MATCH_THRESHOLD must be between 0 and 1 (exclusive)")
         return value
 
     @property

@@ -53,6 +53,7 @@ class RequestRecord:
     original_source: str
     swap_source: str
     media_type: str
+    target_source: Optional[str] = None
     status: str = STATUS_STARTING
     message: Optional[str] = None
     output_file: Optional[str] = None
@@ -83,6 +84,7 @@ class RequestStore:
         original_source: str,
         swap_source: str,
         media_type: str,
+        target_source: Optional[str] = None,
     ) -> RequestRecord:
         """Create (or overwrite) a record with status STARTING."""
         record = RequestRecord(
@@ -90,6 +92,7 @@ class RequestStore:
             original_source=original_source,
             swap_source=swap_source,
             media_type=media_type,
+            target_source=target_source,
             status=STATUS_STARTING,
         )
         self._save(record)

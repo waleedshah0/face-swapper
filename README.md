@@ -11,7 +11,7 @@ shared uploads folder and just needs the swap done.
 
 ```
 Caller (website/mobile server)
-   │  POST /api/swap  (XML: OriginalSource, SwapSource)
+   │  POST /api/swap  (XML: OriginalSource, SwapSource, optional TargetSource)
    ▼
 FastAPI (app/main.py)
    │  validate payload → generate job_id → write status "Starting" to Redis → publish job to RabbitMQ
@@ -100,6 +100,8 @@ faceswap-app/models/inswapper_128.onnx
 
 The face *detection* model (`buffalo_l`) downloads automatically the first
 time you run the app (InsightFace fetches it to `~/.insightface/models/`).
+`buffalo_l` also includes the gender/age model used to pick a default swap
+target — see "Which face gets swapped" below.
 
 If you want the optional face enhancer, install its dependencies first
 (`pip install -r requirements-enhancer.txt` — see the troubleshooting note
@@ -137,6 +139,7 @@ guest/guest), Redis, the API (`http://localhost:8000`), and one worker.
 ```bash
 # terminal 1: RabbitMQ + Redis need to be running and reachable at RABBITMQ_URL / REDIS_URL
 # terminal 2:
+docker compose up -d rabbitmq redis
 uvicorn app.main:app --reload --port 8000
 # terminal 3 (one or more):
 python -m app.worker
@@ -208,13 +211,14 @@ consider changing the default `guest`/`guest` credentials.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/api/swap` | `application/xml`: `<SwapRequest><OriginalSource/><SwapSource/></SwapRequest>` | Validates the payload, generates a `job_id`, queues the job, returns `202` with `{job_id, media_type, status}` immediately. Does not wait for the swap to finish. |
+| POST | `/api/swap` | `application/xml`: `<SwapRequest><OriginalSource/><SwapSource/><TargetSource/></SwapRequest>` | Validates the payload, generates a `job_id`, queues the job, returns `202` with `{job_id, media_type, status}` immediately. Does not wait for the swap to finish. |
 | GET | `/api/swap/{job_id}` | — | Returns the job's current status as a single JSON response and closes immediately. Not a stream — poll it again whenever you want the next update. |
 
-`OriginalSource` and `SwapSource` are filenames expected to already exist in
-`settings.uploads_dir` (the shared folder the website/mobile server drops
-files into). Whether this is an image-on-image or image-on-video swap is
-decided purely by the extension of `OriginalSource`.
+`OriginalSource`, `SwapSource`, and `TargetSource` are filenames expected to
+already exist in `settings.uploads_dir` (the shared folder the
+website/mobile server drops files into). Whether this is an image-on-image
+or image-on-video swap is decided purely by the extension of
+`OriginalSource`.
 
 `job_id` is generated server-side in the `POST /api/swap` response — it's
 the *only* identifier for a job, there's no caller-supplied id in the
@@ -225,18 +229,52 @@ there's no caller-supplied id to de-duplicate against, every `POST
 account for that (e.g. don't blindly retry on timeout without checking
 whether the first request actually landed).
 
+### Which face gets swapped (multi-face photos and videos)
+
+`OriginalSource` can have more than one person in it (e.g. "2 men, 1
+woman"). `TargetSource` (optional) controls which one actually gets
+swapped:
+
+- **`TargetSource` provided** — a reference photo of one specific person.
+  Every detected face in `OriginalSource` is compared against the face in
+  `TargetSource` by face-recognition embedding (not by position), and
+  whichever one matches gets swapped. Everyone else in the shot is left
+  alone. If nobody in `OriginalSource` matches closely enough, the job
+  fails with a clear message rather than silently swapping the wrong
+  person.
+- **`TargetSource` omitted** — the **first female face**, reading left to
+  right, is swapped by default. If no female face is detected at all, the
+  job fails (there's no default to fall back to further).
+
+For video, the same rule applies per frame, but the specific person is
+**locked on** once found — either from `TargetSource` up front, or from
+whichever frame first contains a female face when `TargetSource` isn't
+given — and every later frame matches against that same person's face,
+rather than re-picking independently frame to frame (which could otherwise
+flicker between different people as they move in and out of shot).
+
+The match is governed by `FACE_MATCH_THRESHOLD` in `.env` (default `0.35`,
+cosine similarity) — raise it if the wrong face is occasionally getting
+picked, lower it if the right person is being missed.
+
 Job status is one of `Starting` (queued, not yet picked up), `In progress`
 (a worker is running the swap — for video jobs, `message` carries a rough
 `"NN% complete"` that updates roughly every 5%), `Completed` (`output_file`
 is set — the result is in `settings.outputs_dir`), or `Failed` (`message`
-explains why).
+explains why — including "no matching/female face found").
 
 Example (`curl`):
 
 ```bash
+# default target (first female face):
 curl -X POST http://localhost:8000/api/swap \
   -H "Content-Type: application/xml" \
   -d '<SwapRequest><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource></SwapRequest>'
+
+# specific person via TargetSource:
+curl -X POST http://localhost:8000/api/swap \
+  -H "Content-Type: application/xml" \
+  -d '<SwapRequest><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource><TargetSource>dipika.jpg</TargetSource></SwapRequest>'
 # -> {"job_id": "...", "media_type": "video", "status": "Starting"}
 
 curl http://localhost:8000/api/swap/<job_id-from-above>
@@ -333,6 +371,14 @@ forwarding). Confirm with `docker compose ps` (should show `healthy`) and
 `docker compose logs rabbitmq` (look for `Server startup complete`), then
 just retry starting the worker.
 
+**Job fails with "No female face was detected" or "Could not find the person from TargetSource"**
+Either the default (no `TargetSource`) fallback couldn't find any female
+face in `OriginalSource`, or the person in `TargetSource` genuinely isn't
+in `OriginalSource` closely enough per `FACE_MATCH_THRESHOLD`. Try lowering
+`FACE_MATCH_THRESHOLD` slightly (e.g. `0.3`) if you're confident the person
+is in frame but the pose/lighting/angle differs a lot between
+`TargetSource` and `OriginalSource`.
+
 ## Extending this
 
 - **Temporal smoothing for video**: the current implementation swaps each
@@ -340,10 +386,11 @@ just retry starting the worker.
   footage. A face-tracking pass (carry the previous frame's bounding box
   forward instead of re-detecting from scratch every frame) is the next
   upgrade if you see this in practice.
-- **Multi-face control**: `image_swap.py`/`video_swap.py` currently swap
-  every detected face with the one supplied face. If you need "swap only
-  the 2nd person from the left," that's a matter of letting the user pick
-  which detected face/bbox to target instead of looping over all of them.
+- **Multi-person swaps in one request**: right now exactly one person per
+  `OriginalSource` gets swapped (chosen via `TargetSource` or the female
+  fallback). Swapping multiple different people in the same photo/video
+  with different `SwapSource` faces would mean accepting a list of
+  `(TargetSource, SwapSource)` pairs instead of a single pair.
 - **Dead-lettering**: `app/worker.py` currently acks every message after
   processing, even on failure, and records the failure reason in Redis
   rather than requeuing. If you want RabbitMQ itself to distinguish
