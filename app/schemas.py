@@ -20,6 +20,7 @@ class SwapStatus(BaseModel):
     job_id: str
     original_source: str
     swap_source: str
+    target_source: Optional[str] = None   # reference photo of the specific person to swap, if given
     media_type: str
     status: str                     # "Starting" | "In progress" | "Completed" | "Failed"
     message: Optional[str] = None

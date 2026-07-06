@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import asdict, dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 
 import pika
 from pika.adapters.blocking_connection import BlockingChannel
@@ -38,6 +38,7 @@ class SwapJobMessage:
     original_source: str
     swap_source: str
     media_type: str                 # "image" or "video"
+    target_source: Optional[str] = None  # reference photo of the specific person to swap, if given
 
     def to_json(self) -> str:
         return json.dumps(asdict(self))

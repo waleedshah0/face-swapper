@@ -46,6 +46,7 @@ import logging
 import signal
 import threading
 from pathlib import Path
+from typing import Optional
 
 from pika.adapters.blocking_connection import BlockingChannel, BlockingConnection
 
@@ -92,6 +93,15 @@ def _make_progress_callback(store: RequestStore, job: SwapJobMessage):
     return _on_progress
 
 
+def _resolve_optional_path(filename: Optional[str], label: str) -> Optional[Path]:
+    if not filename:
+        return None
+    path = settings.uploads_dir / filename
+    if not path.is_file():
+        raise FileNotFoundError(f"{label} not found: {filename}")
+    return path
+
+
 def _run_swap(store: RequestStore, job: SwapJobMessage) -> Path:
     """Resolve the job's file paths and run the same swap pipeline the old sync endpoint used."""
     original_path = settings.uploads_dir / job.original_source
@@ -102,17 +112,20 @@ def _run_swap(store: RequestStore, job: SwapJobMessage) -> Path:
     if not face_path.is_file():
         raise FileNotFoundError(f"SwapSource not found: {job.swap_source}")
 
+    target_path = _resolve_optional_path(job.target_source, "TargetSource")
+
     if job.media_type == "video":
         output_path = settings.outputs_dir / f"{job.job_id}.mp4"
         swap_video(
             original_path, face_path, output_path,
+            target_path=target_path,
             progress_cb=_make_progress_callback(store, job),
         )
     else:
         # Images are sub-second to a couple of seconds — not worth the extra
         # Redis writes a progress callback would add.
         output_path = settings.outputs_dir / f"{job.job_id}.png"
-        swap_image(original_path, face_path, output_path)
+        swap_image(original_path, face_path, output_path, target_path=target_path)
 
     return output_path
 
@@ -138,7 +151,10 @@ def _mark_failed(store: RequestStore, job: SwapJobMessage, message: str) -> None
 
 
 def _process_job(store: RequestStore, job: SwapJobMessage) -> None:
-    logger.info("Picked up job_id=%s (%s)", job.job_id, job.media_type)
+    logger.info(
+        "Picked up job_id=%s (%s)%s", job.job_id, job.media_type,
+        " with TargetSource" if job.target_source else " (default target: first female face)",
+    )
 
     try:
         store.update_status(job.job_id, STATUS_IN_PROGRESS)
@@ -150,6 +166,8 @@ def _process_job(store: RequestStore, job: SwapJobMessage) -> None:
     try:
         output_path = _run_swap(store, job)
     except NoFaceFoundError as exc:
+        # Covers both "no face at all" and TargetFaceNotFoundError (no
+        # detected face matched TargetSource / no female face found).
         _mark_failed(store, job, str(exc))
     except Exception as exc:  # noqa: BLE001 - last line of defense so one bad job can't kill the worker
         logger.exception("Unexpected error processing job_id=%s", job.job_id)

@@ -7,6 +7,7 @@ FastAPI service (no frontend) exposing:
         <SwapRequest>
           <OriginalSource>video1.mp4</OriginalSource>
           <SwapSource>image2.jpg</SwapSource>
+          <TargetSource>dipika.jpg</TargetSource>   <!-- optional -->
         </SwapRequest>
 
       OriginalSource and SwapSource are filenames expected to already exist
@@ -15,17 +16,29 @@ FastAPI service (no frontend) exposing:
       image-on-video swap is decided purely by the extension of
       OriginalSource.
 
+      TargetSource is optional and matters when OriginalSource has more
+      than one face in it (e.g. a video with 2 men and 1 woman). It's a
+      reference photo of the specific person whose face should be
+      replaced:
+        - TargetSource given: whichever face in OriginalSource matches that
+          person (by face recognition) gets swapped; everyone else is left
+          alone.
+        - TargetSource omitted: the first female face (reading left to
+          right) is swapped by default.
+      See app/core/face_engine.py:select_target_face() for the matching
+      logic, and FACE_MATCH_THRESHOLD in .env for tuning it.
+
       This endpoint only validates the request and hands the actual swap
-      off to a queue — it does not perform the swap itself. Once
-      OriginalSource and SwapSource have been validated (files exist, are
-      the right type, and are within the configured size limits), a job_id
-      is generated, a status record is written to Redis under it with
-      status "Starting", and a job message is published to RabbitMQ (see
-      app/broker.py). The response comes back immediately (202 Accepted)
-      with job_id — it does not wait for the swap to finish. job_id is the
-      only identifier for the job; there is no caller-supplied id, so the
-      caller must hang on to the job_id from the response to check status
-      later, and each POST always creates a brand new job (no de-dup).
+      off to a queue — it does not perform the swap itself. Once the
+      payload has been validated (files exist, are the right type, and are
+      within the configured size limits), a job_id is generated, a status
+      record is written to Redis under it with status "Starting", and a
+      job message is published to RabbitMQ (see app/broker.py). The
+      response comes back immediately (202 Accepted) with job_id — it does
+      not wait for the swap to finish. job_id is the only identifier for
+      the job; there is no caller-supplied id, so the caller must hang on
+      to the job_id from the response to check status later, and each POST
+      always creates a brand new job (no de-dup).
 
       app/worker.py is the separate, long-running process that actually
       consumes jobs off the queue, runs the swap, and updates the job's
@@ -47,6 +60,7 @@ import logging
 import uuid
 from dataclasses import asdict
 from pathlib import Path
+from typing import Optional, Tuple
 from xml.etree import ElementTree as ET
 
 from fastapi import Body, FastAPI, HTTPException
@@ -72,8 +86,8 @@ logger = logging.getLogger("faceswap.main")
 app = FastAPI(title="Face Swap Service API")
 
 
-def _parse_swap_request(xml_body: str) -> tuple[str, str]:
-    """Parse and sanity-check the XML payload. Returns (original_source, swap_source)."""
+def _parse_swap_request(xml_body: str) -> Tuple[str, str, Optional[str]]:
+    """Parse and sanity-check the XML payload. Returns (original_source, swap_source, target_source)."""
     try:
         root = ET.fromstring(xml_body)
     except ET.ParseError as exc:
@@ -87,13 +101,14 @@ def _parse_swap_request(xml_body: str) -> tuple[str, str]:
 
     original_source = safe_filename(root.findtext("OriginalSource"))
     swap_source = safe_filename(root.findtext("SwapSource"))
+    target_source = safe_filename(root.findtext("TargetSource"))  # optional
 
     if not original_source:
         raise HTTPException(status_code=400, detail="Missing OriginalSource.")
     if not swap_source:
         raise HTTPException(status_code=400, detail="Missing SwapSource.")
 
-    return original_source, swap_source
+    return original_source, swap_source, target_source
 
 
 def _resolve_upload_path(filename: str, label: str) -> Path:
@@ -115,12 +130,19 @@ def _media_type_for(original_name: str) -> str:
     )
 
 
-def _validate_sources(original_path: Path, face_path: Path, media_type: str) -> None:
+def _validate_sources(
+    original_path: Path,
+    face_path: Path,
+    media_type: str,
+    target_path: Optional[Path],
+) -> None:
     if media_type == "video":
         validate_video_path(original_path, settings.max_video_mb, label="OriginalSource")
     else:
         validate_image_path(original_path, settings.max_image_mb, label="OriginalSource")
     validate_image_path(face_path, settings.max_image_mb, label="SwapSource")
+    if target_path is not None:
+        validate_image_path(target_path, settings.max_image_mb, label="TargetSource")
 
 
 # --------------------------------------------------------------------------- #
@@ -135,21 +157,25 @@ async def api_swap(
         example="""<SwapRequest>
   <OriginalSource>video1.mp4</OriginalSource>
   <SwapSource>image2.jpg</SwapSource>
+  <TargetSource>dipika.jpg</TargetSource>
 </SwapRequest>""",
     ),
 ):
-    original_name, swap_name = _parse_swap_request(xml_body)
+    original_name, swap_name, target_name = _parse_swap_request(xml_body)
     media_type = _media_type_for(original_name)
 
     original_path = _resolve_upload_path(original_name, "OriginalSource")
     face_path = _resolve_upload_path(swap_name, "SwapSource")
-    _validate_sources(original_path, face_path, media_type)
+    target_path = _resolve_upload_path(target_name, "TargetSource") if target_name else None
+    _validate_sources(original_path, face_path, media_type, target_path)
 
     job_id = str(uuid.uuid4())
     store = get_store()
 
     try:
-        await run_in_threadpool(store.create, job_id, original_name, swap_name, media_type)
+        await run_in_threadpool(
+            store.create, job_id, original_name, swap_name, media_type, target_name
+        )
     except RequestStoreError as exc:
         logger.exception("Status cache unavailable")
         raise HTTPException(status_code=503, detail="Status cache unavailable. Try again shortly.") from exc
@@ -159,6 +185,7 @@ async def api_swap(
         original_source=original_name,
         swap_source=swap_name,
         media_type=media_type,
+        target_source=target_name,
     )
     try:
         await run_in_threadpool(publish_swap_job, job_message)
