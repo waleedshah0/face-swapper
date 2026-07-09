@@ -145,6 +145,8 @@ uvicorn app.main:app --reload --port 8000
 python -m app.worker
 ```
 
+docker compose stop rabbitmq redis
+docker compose rm -f rabbitmq redis
 ## Deploying to a server (GPU)
 
 The image is built once and used for **both** the API and the worker — the
@@ -285,6 +287,70 @@ plain request/response, not a held-open connection, so a standard HTTP
 client (or Swagger's "Try it out") works fine, unlike a Server-Sent Events
 or WebSocket stream would.
 
+### Improving swap quality
+
+Two independent, best-effort post-processing passes run after the raw
+`inswapper_128` swap, both in `app/core/face_engine.py:swap_face_in_frame()`:
+
+- **Color correction** (`ENABLE_COLOR_CORRECTION`, default `true`) — the raw
+  model pastes the source face's own color/lighting as-is, which is most of
+  why untouched swaps can look "pasted on". This shifts the pasted face's
+  color statistics (in LAB space) to match the frame it landed in, blended
+  back with a feathered mask so the fix doesn't add its own hard edge. No
+  extra model, negligible cost — leave this on.
+- **Face enhancer** (`ENABLE_FACE_ENHANCER`, default `false`) — a GAN-based
+  restoration pass that sharpens/cleans the swapped face. Meaningfully
+  better output, but roughly doubles per-frame time on CPU — worth it once
+  you're on GPU (see "Deploying to a server" above), off by default for
+  fast local testing. `FACE_ENHANCER_MODEL` picks which restoration model
+  runs (both ship inside the `gfpgan` package already in `requirements-
+  enhancer.txt`, so switching is a config change, not a new dependency, and
+  both are Apache 2.0 / commercial-safe):
+  - `gfpgan` (default) — GFPGANv1.4.
+  - `restoreformer` — RestoreFormer; generally better identity preservation
+    and detail than GFPGAN at similar speed, worth trying if GFPGAN's
+    output looks too "smoothed"/beautified for your use case. Note
+    `FACE_ENHANCER_WEIGHT` has no effect with this model (that parameter is
+    specific to GFPGAN's architecture; RestoreFormer silently ignores it).
+
+  A note on a commonly-recommended third option, **CodeFormer**: it's
+  generally considered the strongest of the three, especially on
+  occlusions like glasses, but its weights are licensed **non-commercial
+  only** (S-Lab License 1.0 — commercial use requires contacting the
+  authors) and it isn't a properly maintained pip package, so it isn't
+  wired up here. Worth it if this deployment is genuinely non-commercial/
+  internal and you're willing to vendor its architecture code; skip it
+  otherwise.
+
+**Glasses/eyewear look distorted or blurred after enhancement:** this is a
+known GFPGAN limitation — its restoration model is trained mostly on bare
+faces, and lens glare/frame edges commonly get misread as noise and
+"corrected" away. Two settings address it, both on by default when the
+enhancer is enabled:
+
+- `PROTECT_EYEWEAR_REGION` (default `true`) — uses the face's eye
+  landmarks to build a band over the glasses area and blends GFPGAN's
+  output back toward the pre-enhancement swap result there, so the rest of
+  the face still gets sharpened normally. See
+  `app/core/face_engine.py:_eye_band_mask()` / `_apply_face_enhancer()`.
+- `EYEWEAR_PROTECTION_STRENGTH` (default `0.6`, range `0-1`) — how strongly
+  to protect that band. Raise it toward `1.0` if glasses are still visibly
+  warped; lower it if the eye area now looks noticeably softer than the
+  rest of the enhanced face.
+- `FACE_ENHANCER_WEIGHT` (default `0.5`, range `0-1`) — GFPGAN's own
+  restoration strength, independent of the eyewear band. Lowering it (e.g.
+  `0.3`) makes GFPGAN's output closer to the raw swap everywhere, which
+  can help if distortion isn't limited to the eyewear area.
+
+If a swap still looks off after all of the above:
+- **Wrong face picked** — tune `FACE_MATCH_THRESHOLD` (see above).
+- **Blurry/low-detail result** — turn on `ENABLE_FACE_ENHANCER`, and use a
+  sharp, well-lit, front-facing `SwapSource` photo; output quality is
+  bottlenecked by the source photo's quality as much as by any setting here.
+- **Visible seam/edge around the face** — this is what color correction
+  targets; confirm `ENABLE_COLOR_CORRECTION=true` and it's not being
+  swallowed by a stale `.env`.
+
 ## Performance / scaling notes
 
 - **Model loading is lazy and cached per worker process**
@@ -378,6 +444,39 @@ in `OriginalSource` closely enough per `FACE_MATCH_THRESHOLD`. Try lowering
 `FACE_MATCH_THRESHOLD` slightly (e.g. `0.3`) if you're confident the person
 is in frame but the pose/lighting/angle differs a lot between
 `TargetSource` and `OriginalSource`.
+
+**Worker crashes mid-job with `PRECONDITION_FAILED - delivery acknowledgement ... timed out`**
+RabbitMQ 3.8+ force-closes a channel if a delivered message isn't acked
+within `consumer_timeout` (default 30 minutes) — this is a broker-side
+safety net, separate from the heartbeat handling described in
+`app/worker.py`'s threading note (the swap itself was still running fine in
+the background thread; it just couldn't ack in time). A CPU video job with
+`ENABLE_FACE_ENHANCER=true` can easily take longer than 30 minutes.
+`rabbitmq.conf` (mounted into the `rabbitmq` service in both
+`docker-compose.yml` and `docker-compose.prod.yml`) raises this to 6 hours —
+recreate the `rabbitmq` container after pulling this change
+(`docker compose up -d --force-recreate rabbitmq`) for it to take effect. If
+you're deploying with `docker-compose.prod.yml`, remember to copy
+`rabbitmq.conf` onto the server alongside it.
+
+If jobs are hitting this at all, it's worth checking *why* a job is taking
+that long in the first place — two common causes, both visible in the
+worker's per-frame log lines:
+- **Silent CPU fallback**: if you set `EXECUTION_PROVIDER=cuda` but the log
+  shows `Applied providers: ['CPUExecutionProvider']` and/or "GPU requested
+  but CUDA is unavailable", onnxruntime couldn't load its CUDA provider
+  (commonly a missing/mismatched CUDA/cuDNN DLL — see "GPU not picked up"
+  above) and silently ran the whole job on CPU instead, which is 10-20x
+  slower and the main reason a job would run long enough to hit this
+  timeout at all.
+- **Per-frame time climbing over the course of the job** (e.g. 1s/frame at
+  the start, 15-20s/frame by the middle): consistent with memory pressure
+  on a CPU-only run holding `buffalo_l` + `inswapper_128` + GFPGAN in memory
+  simultaneously. The frame loop now calls `gc.collect()` periodically as
+  cheap insurance (see `GC_EVERY_N_FRAMES` in `app/core/video_swap.py`); if
+  it's still climbing after that, it's genuine system memory pressure —
+  check Task Manager, close other memory-heavy applications, or (biggest
+  lever) turn off `ENABLE_FACE_ENHANCER` for video on CPU.
 
 ## Extending this
 

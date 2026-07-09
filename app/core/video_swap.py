@@ -20,6 +20,7 @@ underlying model — see README.md for notes on extending this.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import subprocess
 import time
@@ -48,6 +49,15 @@ ProgressCB = Optional[Callable[[float], None]]
 # default, which makes a slow CPU run look identical to a hung one — this
 # line is what makes the process's liveness visible while it's working.
 LOG_EVERY_N_FRAMES = 10
+
+# Long CPU runs (buffalo_l + inswapper_128 + optionally GFPGAN, all holding
+# onto numpy/torch buffers every frame) can accumulate enough short-lived
+# garbage between Python's normal refcounting collections that per-frame
+# time visibly climbs over a long video. A periodic explicit collect() is
+# cheap insurance against that; if per-frame time is still climbing despite
+# this, it's genuine memory pressure (see README troubleshooting) rather
+# than something this loop can fix on its own.
+GC_EVERY_N_FRAMES = 20
 
 
 def _ffmpeg_has_audio(video_path: Path) -> bool:
@@ -164,6 +174,9 @@ def swap_video(
 
             writer.write(frame)
             frame_idx += 1
+
+            if frame_idx % GC_EVERY_N_FRAMES == 0:
+                gc.collect()
 
             if total_frames:
                 pct = min(99.0, 95.0 * frame_idx / total_frames)

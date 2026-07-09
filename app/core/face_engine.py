@@ -20,6 +20,7 @@ import threading
 from pathlib import Path
 from typing import List, Optional
 
+import cv2
 import numpy as np
 
 from app.config import settings
@@ -70,8 +71,26 @@ def _load_face_swapper():
     return insightface.model_zoo.get_model(str(model_path), providers=settings.onnx_providers)
 
 
+# Both restoration models below ship inside the already-installed `gfpgan`
+# package (GFPGANer just takes a different `arch` + checkpoint), so picking
+# either one needs no new dependency. See FACE_ENHANCER_MODEL in config.py
+# for the tradeoffs.
+_ENHANCER_MODELS = {
+    "gfpgan": {
+        "arch": "clean",
+        "channel_multiplier": 2,
+        "model_path": "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
+    },
+    "restoreformer": {
+        "arch": "RestoreFormer",
+        "channel_multiplier": 2,
+        "model_path": "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.4/RestoreFormer.pth",
+    },
+}
+
+
 def _load_face_enhancer():
-    """Optional GFPGAN restoration pass to sharpen/clean the swapped face."""
+    """Optional GAN-based restoration pass to sharpen/clean the swapped face."""
     if not settings.enable_face_enhancer:
         return None
     try:
@@ -81,14 +100,17 @@ def _load_face_enhancer():
         device = "cuda" if settings.use_cuda and torch.cuda.is_available() else "cpu"
         if settings.use_cuda and device == "cpu":
             logger.warning(
-                "GFPGAN GPU requested but CUDA is unavailable; falling back to CPU."
+                "Face enhancer GPU requested but CUDA is unavailable; falling back to CPU."
             )
 
+        model_config = _ENHANCER_MODELS[settings.face_enhancer_model]
+        logger.info("Face enhancer model: %s", settings.face_enhancer_model)
+
         return GFPGANer(
-            model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
+            model_path=model_config["model_path"],
             upscale=1,
-            arch="clean",
-            channel_multiplier=2,
+            arch=model_config["arch"],
+            channel_multiplier=model_config["channel_multiplier"],
             device=device,
         )
     except Exception as exc:  # pragma: no cover - enhancer is best-effort
@@ -108,7 +130,7 @@ def get_engine():
                 logger.info("Loading face swapper (inswapper_128)...")
                 _face_swapper = _load_face_swapper()
             if _face_enhancer is None and settings.enable_face_enhancer:
-                logger.info("Loading face enhancer (GFPGAN)...")
+                logger.info("Loading face enhancer (%s)...", settings.face_enhancer_model)
                 _face_enhancer = _load_face_enhancer()
     return _face_analyser, _face_swapper, _face_enhancer
 
@@ -209,6 +231,170 @@ def select_target_face(
     return None
 
 
+# --------------------------------------------------------------------------- #
+# Color correction.
+#
+# inswapper_128 pastes the source identity's face as-is — it doesn't correct
+# for skin-tone/lighting differences between the SwapSource photo and the
+# frame it's pasted into, which is a big part of why raw swaps can look
+# "pasted on". This shifts the pasted face's color statistics (in LAB space,
+# which separates lightness from color) to match the frame it landed in,
+# using the pre-swap frame as the lighting reference, then blends the
+# correction back with a feathered mask so the fix itself doesn't introduce
+# a new hard edge. Cheap: numpy/cv2 only, no extra model, negligible cost
+# next to the swap model itself. Toggle via ENABLE_COLOR_CORRECTION.
+# --------------------------------------------------------------------------- #
+
+_COLOR_CORRECTION_PADDING_RATIO = 0.15  # extra context sampled around the face box
+
+
+def _match_color_lab(source_bgr: np.ndarray, reference_bgr: np.ndarray) -> np.ndarray:
+    """Shift source_bgr's color/lighting statistics to match reference_bgr."""
+    source_lab = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+    reference_lab = cv2.cvtColor(reference_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
+
+    source_mean, source_std = source_lab.mean(axis=(0, 1)), source_lab.std(axis=(0, 1))
+    reference_mean, reference_std = reference_lab.mean(axis=(0, 1)), reference_lab.std(axis=(0, 1))
+    source_std = np.clip(source_std, 1e-3, None)
+
+    corrected = (source_lab - source_mean) * (reference_std / source_std) + reference_mean
+    corrected = np.clip(corrected, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(corrected, cv2.COLOR_LAB2BGR)
+
+
+def _feathered_box_mask(height: int, width: int, box: tuple) -> np.ndarray:
+    """A float32 HxWx1 mask: 1.0 inside `box`, fading to 0.0 over a soft edge."""
+    x1, y1, x2, y2 = box
+    mask = np.zeros((height, width), dtype=np.float32)
+    cv2.rectangle(mask, (x1, y1), (x2, y2), 1.0, thickness=-1)
+    feather = max(5, int(0.2 * min(x2 - x1, y2 - y1))) | 1  # odd kernel size required
+    mask = cv2.GaussianBlur(mask, (feather, feather), 0)
+    return mask[:, :, None]
+
+
+def _color_correct_pasted_face(
+    swapped_frame: np.ndarray, pre_swap_frame: np.ndarray, bbox
+) -> np.ndarray:
+    """
+    Correct the just-pasted face region in `swapped_frame` so its color/
+    lighting matches the frame, using `pre_swap_frame` (the same frame
+    before swapping) as the reference for what that lighting looks like.
+    """
+    h, w = swapped_frame.shape[:2]
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 <= x1 or y2 <= y1:
+        return swapped_frame
+
+    pad_x = int((x2 - x1) * _COLOR_CORRECTION_PADDING_RATIO)
+    pad_y = int((y2 - y1) * _COLOR_CORRECTION_PADDING_RATIO)
+    cx1, cy1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+    cx2, cy2 = min(w, x2 + pad_x), min(h, y2 + pad_y)
+
+    fake_crop = swapped_frame[cy1:cy2, cx1:cx2]
+    reference_crop = pre_swap_frame[cy1:cy2, cx1:cx2]
+    if fake_crop.size == 0 or reference_crop.size == 0:
+        return swapped_frame
+
+    corrected_crop = _match_color_lab(fake_crop, reference_crop)
+    mask = _feathered_box_mask(
+        cy2 - cy1, cx2 - cx1, (x1 - cx1, y1 - cy1, x2 - cx1, y2 - cy1)
+    )
+    blended_crop = (
+        corrected_crop.astype(np.float32) * mask + fake_crop.astype(np.float32) * (1 - mask)
+    ).astype(np.uint8)
+
+    output = swapped_frame.copy()
+    output[cy1:cy2, cx1:cx2] = blended_crop
+    return output
+
+
+# --------------------------------------------------------------------------- #
+# Eyewear protection.
+#
+# GFPGAN's restoration model is trained mostly on bare faces, and glasses
+# are a common failure case: lens glare/reflections and frame edges get
+# misread as noise/artifacts and "corrected" away, which can warp or blur
+# the glasses. There's no separate glasses-detection model here — instead
+# this reuses the 5-point landmarks InsightFace already computed (left eye,
+# right eye, ...) to build a band over the eye/glasses area, and blends
+# GFPGAN's output back toward the pre-enhancement (post-swap) frame in that
+# band, so the rest of the face still gets sharpened normally. Toggle via
+# PROTECT_EYEWEAR_REGION; tune how strong the protection is via
+# EYEWEAR_PROTECTION_STRENGTH.
+# --------------------------------------------------------------------------- #
+
+
+def _eye_band_mask(height: int, width: int, kps) -> Optional[np.ndarray]:
+    """
+    A float32 HxWx1 mask, 1.0 over the eye/glasses band (fading out via a
+    Gaussian blur), built from `kps` — the face's 5-point landmarks
+    (left eye, right eye, nose, mouth corners), in that order, as returned
+    by InsightFace. Returns None if landmarks aren't usable.
+    """
+    if kps is None or len(kps) < 2:
+        return None
+
+    left_eye = np.asarray(kps[0], dtype=np.float32)
+    right_eye = np.asarray(kps[1], dtype=np.float32)
+    eye_dist = float(np.linalg.norm(right_eye - left_eye))
+    if eye_dist <= 0:
+        return None
+
+    cx, cy = (left_eye + right_eye) / 2.0
+    half_w = eye_dist * 1.3
+    half_h = eye_dist * 0.65
+
+    x1, y1 = int(cx - half_w), int(cy - half_h)
+    x2, y2 = int(cx + half_w), int(cy + half_h)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(width, x2), min(height, y2)
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    mask = np.zeros((height, width), dtype=np.float32)
+    cv2.rectangle(mask, (x1, y1), (x2, y2), 1.0, thickness=-1)
+    feather = max(5, int(0.6 * (y2 - y1))) | 1  # odd kernel size required
+    mask = cv2.GaussianBlur(mask, (feather, feather), 0)
+    return mask[:, :, None]
+
+
+def _apply_face_enhancer(
+    result: np.ndarray, face_enhancer, target_face: Optional[object]
+) -> np.ndarray:
+    """
+    Run the configured enhancer (GFPGAN or RestoreFormer — see
+    FACE_ENHANCER_MODEL) and, if enabled, protect the eye/glasses band from
+    its output by blending back toward the pre-enhancement frame.
+
+    Note: `weight` only affects GFPGAN's "clean" arch (it blends between
+    restored and original in an intermediate style layer specific to that
+    architecture). RestoreFormer's forward() accepts and ignores it via
+    **kwargs, so FACE_ENHANCER_WEIGHT is a no-op when
+    FACE_ENHANCER_MODEL=restoreformer — harmless, just not applicable.
+    """
+    pre_enhance = result.copy()
+    _, _, enhanced = face_enhancer.enhance(
+        result, has_aligned=False, only_center_face=False, paste_back=True,
+        weight=settings.face_enhancer_weight,
+    )
+
+    if not settings.protect_eyewear_region or target_face is None:
+        return enhanced
+
+    kps = getattr(target_face, "kps", None)
+    mask = _eye_band_mask(enhanced.shape[0], enhanced.shape[1], kps)
+    if mask is None:
+        return enhanced
+
+    protect = mask * settings.eyewear_protection_strength
+    blended = (
+        enhanced.astype(np.float32) * (1 - protect) + pre_enhance.astype(np.float32) * protect
+    ).astype(np.uint8)
+    return blended
+
+
 def swap_face_in_frame(
     frame: np.ndarray,
     source_face,
@@ -218,15 +404,34 @@ def swap_face_in_frame(
 ) -> np.ndarray:
     """
     Paste `source_face`'s identity onto `target_face` in `frame`. Returns the
-    modified frame (frame is also modified in-place by the model).
+    modified frame.
+
+    Two optional, cheap post-processing passes run after the raw model swap:
+      - color correction (ENABLE_COLOR_CORRECTION, default on): fixes the
+        "pasted on" look by matching the swapped face's lighting/skin tone
+        to the frame. See _color_correct_pasted_face() above.
+      - face enhancer (ENABLE_FACE_ENHANCER, default off): GFPGAN sharpening
+        pass, with its restoration strength tunable via FACE_ENHANCER_WEIGHT,
+        and the eye/glasses band optionally protected from GFPGAN's known
+        glasses artifacts via PROTECT_EYEWEAR_REGION /
+        EYEWEAR_PROTECTION_STRENGTH. See _apply_face_enhancer() above.
+    Both passes are best-effort — if either fails on a given frame, the swap
+    still returns rather than crashing the whole job over a cosmetic pass.
     """
+    # face_swapper.get() modifies `frame` in place, so grab a copy first to
+    # use as the "what did this area look like before swapping" reference.
+    pre_swap_frame = frame.copy()
     result = face_swapper.get(frame, target_face, source_face, paste_back=True)
+
+    if settings.enable_color_correction and target_face is not None:
+        try:
+            result = _color_correct_pasted_face(result, pre_swap_frame, target_face.bbox)
+        except Exception as exc:  # pragma: no cover - correction is best-effort
+            logger.warning("Color correction failed on a frame, using raw swap: %s", exc)
 
     if face_enhancer is not None:
         try:
-            _, _, result = face_enhancer.enhance(
-                result, has_aligned=False, only_center_face=False, paste_back=True
-            )
+            result = _apply_face_enhancer(result, face_enhancer, target_face)
         except Exception as exc:  # pragma: no cover - enhancer is best-effort
             logger.warning("Face enhancement failed on a frame, using raw swap: %s", exc)
 

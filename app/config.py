@@ -18,6 +18,39 @@ class Settings(BaseSettings):
     swapper_model_path: str = Field(default="models/inswapper_128.onnx", alias="SWAPPER_MODEL_PATH")
     enable_face_enhancer: bool = Field(default=False, alias="ENABLE_FACE_ENHANCER")
 
+    # Which restoration model GFPGANer loads (both come from the already-
+    # installed `gfpgan` package, no extra dependency either way):
+    #   "gfpgan"        - GFPGANv1.4 (the original default here).
+    #   "restoreformer" - RestoreFormer (Apache 2.0, same license terms as
+    #                     GFPGAN itself). Generally a step up in identity
+    #                     preservation and detail over GFPGAN, at similar
+    #                     speed. See app/core/face_engine.py:_load_face_enhancer().
+    face_enhancer_model: str = Field(default="gfpgan", alias="FACE_ENHANCER_MODEL")
+
+    # inswapper_128 doesn't correct for skin-tone/lighting mismatch between
+    # the pasted face and the frame it lands in ("pasted on" look). This
+    # shifts the pasted face's color statistics to match its surroundings —
+    # cheap (numpy/cv2 only, no extra model) so it defaults on. See
+    # app/core/face_engine.py:_color_correct_pasted_face().
+    enable_color_correction: bool = Field(default=True, alias="ENABLE_COLOR_CORRECTION")
+
+    # GFPGAN's own restoration strength (0=barely touches the face, closer
+    # to the raw swap; 1=maximum restoration). Lower this if GFPGAN is
+    # visibly distorting faces wearing glasses or other accessories.
+    face_enhancer_weight: float = Field(default=0.5, alias="FACE_ENHANCER_WEIGHT")
+
+    # GFPGAN's face-restoration model is trained mostly on bare faces and
+    # commonly warps/blurs eyeglasses (misreads lens glare/frame edges as
+    # noise to "fix"). When true, the eye/glasses band of the face is
+    # blended back toward the pre-enhancement swap result rather than fully
+    # replaced by GFPGAN's output. See app/core/face_engine.py:_eye_band_mask().
+    protect_eyewear_region: bool = Field(default=True, alias="PROTECT_EYEWEAR_REGION")
+
+    # How strongly to protect the eye band from GFPGAN's changes: 0=no
+    # protection (identical to GFPGAN's raw output), 1=eye band left exactly
+    # as the swap produced it (no enhancer effect there at all).
+    eyewear_protection_strength: float = Field(default=0.6, alias="EYEWEAR_PROTECTION_STRENGTH")
+
     max_image_mb: int = Field(default=15, alias="MAX_IMAGE_MB")
     max_video_mb: int = Field(default=300, alias="MAX_VIDEO_MB")
 
@@ -51,6 +84,15 @@ class Settings(BaseSettings):
     def normalize_execution_provider(cls, value: str) -> str:
         return value.strip().lower()
 
+    @field_validator("face_enhancer_model")
+    @classmethod
+    def validate_face_enhancer_model(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        allowed = {"gfpgan", "restoreformer"}
+        if normalized not in allowed:
+            raise ValueError(f"FACE_ENHANCER_MODEL must be one of {sorted(allowed)}")
+        return normalized
+
     @field_validator(
         "max_image_mb",
         "max_video_mb",
@@ -69,6 +111,13 @@ class Settings(BaseSettings):
     def validate_face_match_threshold(cls, value: float) -> float:
         if not (0.0 < value < 1.0):
             raise ValueError("FACE_MATCH_THRESHOLD must be between 0 and 1 (exclusive)")
+        return value
+
+    @field_validator("face_enhancer_weight", "eyewear_protection_strength")
+    @classmethod
+    def validate_unit_interval(cls, value: float) -> float:
+        if not (0.0 <= value <= 1.0):
+            raise ValueError("Value must be between 0 and 1 (inclusive)")
         return value
 
     @property
