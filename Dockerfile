@@ -1,42 +1,63 @@
-# GPU-enabled Dockerfile for the Face Swap Studio app.
-# This image is intended to run on a host with NVIDIA drivers and a supported GPU.
-#
-# This single image now serves two roles, selected by the command the
-# container is run with:
-#   - API      (default CMD below): uvicorn app.main:app ...   — does NOT need --gpus
-#   - Worker:  python3 -m app.worker                            — needs --gpus, does the swap
-# See docker-compose.prod.yml for how both are run from this one image.
-#
-# .env is intentionally NOT copied into the image (see .dockerignore) — pass
-# it at container-start time instead (`--env-file .env` / `env_file:` in
-# compose), so changing config like RABBITMQ_URL/REDIS_URL doesn't require
-# rebuilding and re-pushing the image.
+# syntax=docker/dockerfile:1.7
 
-FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+FROM nvidia/cuda:12.8.1-cudnn-runtime-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
-    PIP_DEFAULT_TIMEOUT=600 \
-    PIP_RETRIES=10
+    PIP_DEFAULT_TIMEOUT=1200 \
+    PIP_RETRIES=20 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-dev python3-pip python3-venv ffmpeg libgl1 libglib2.0-0 build-essential gcc g++ \
+    python3 \
+    python3-dev \
+    python3-pip \
+    python3-venv \
+    ffmpeg \
+    libgl1 \
+    libglib2.0-0 \
+    build-essential \
+    gcc \
+    g++ \
+    ca-certificates \
+    && update-ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv/app
 
 COPY requirements.txt requirements-enhancer.txt ./
-RUN python3 -m pip install --upgrade pip setuptools wheel && \
-    python3 -m pip install --no-cache-dir --retries 10 --timeout 600 -r requirements.txt
 
-ARG INSTALL_ENHANCER=false
-RUN if [ "$INSTALL_ENHANCER" = "true" ] ; then \
-    python3 -m pip install --no-cache-dir -r requirements-enhancer.txt ; \
+RUN python3 -m pip install --upgrade pip setuptools wheel
+
+ARG INSTALL_ENHANCER=true
+
+# Install the large Blackwell-compatible PyTorch wheels separately.
+# Do not use --no-cache-dir here.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$INSTALL_ENHANCER" = "true" ]; then \
+        python3 -m pip install \
+          --retries 20 \
+          --timeout 1200 \
+          --index-url https://download.pytorch.org/whl/cu128 \
+          torch==2.7.1+cu128 \
+          torchvision==0.22.1+cu128; \
+    fi
+
+# Install the remaining project packages.
+RUN --mount=type=cache,target=/root/.cache/pip \
+    if [ "$INSTALL_ENHANCER" = "true" ]; then \
+        python3 -m pip install \
+          --retries 20 \
+          --timeout 1200 \
+          -r requirements.txt \
+          -r requirements-enhancer.txt; \
+    else \
+        python3 -m pip install \
+          --retries 20 \
+          --timeout 1200 \
+          -r requirements.txt; \
     fi
 
 COPY . .
-
-# Ensure the ONNX swapper model is available in ./models at runtime.
-# You can mount it with -v /host/path/models:/srv/app/models or copy it into the repo.
 
 EXPOSE 8000
 

@@ -31,6 +31,7 @@ _lock = threading.Lock()
 _face_analyser = None
 _face_swapper = None
 _face_enhancer = None
+_face_enhancer_disabled_reason = None
 
 
 class NoFaceFoundError(Exception):
@@ -89,12 +90,34 @@ _ENHANCER_MODELS = {
 }
 
 
+def _patch_torchvision_functional_tensor() -> None:
+    """
+    basicsr==1.4.2 (a gfpgan dependency) imports
+    `torchvision.transforms.functional_tensor`, a module torchvision
+    removed in 0.17+ (its contents — e.g. rgb_to_grayscale — moved into
+    `torchvision.transforms.functional` under the same names). basicsr is
+    unmaintained since 2022 and won't be updated to match, so this
+    registers a module alias satisfying that import without patching
+    basicsr's source or downgrading torchvision. Must run before
+    `from gfpgan import GFPGANer`, which imports basicsr transitively.
+    Safe/idempotent to call more than once.
+    """
+    import sys
+
+    if "torchvision.transforms.functional_tensor" in sys.modules:
+        return
+    import torchvision.transforms.functional as _functional
+    sys.modules["torchvision.transforms.functional_tensor"] = _functional
+
+
 def _load_face_enhancer():
     """Optional GAN-based restoration pass to sharpen/clean the swapped face."""
     if not settings.enable_face_enhancer:
         return None
     try:
         import torch
+
+        _patch_torchvision_functional_tensor()
         from gfpgan import GFPGANer
 
         device = "cuda" if settings.use_cuda and torch.cuda.is_available() else "cpu"
@@ -103,8 +126,29 @@ def _load_face_enhancer():
                 "Face enhancer GPU requested but CUDA is unavailable; falling back to CPU."
             )
 
+        if device == "cuda":
+            major, minor = torch.cuda.get_device_capability(0)
+            required_arch = f"sm_{major}{minor}"
+            compiled_arches = set(torch.cuda.get_arch_list())
+            logger.info(
+                "Enhancer PyTorch=%s, CUDA runtime=%s, GPU=%s (%s), compiled_arches=%s",
+                torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0),
+                required_arch, sorted(compiled_arches),
+            )
+            if required_arch not in compiled_arches:
+                raise RuntimeError(
+                    f"Installed PyTorch {torch.__version__} does not include {required_arch} kernels "
+                    f"for {torch.cuda.get_device_name(0)}. Install a CUDA 12.8+ PyTorch wheel "
+                    "(torch>=2.7, torchvision matching torch) from "
+                    "https://download.pytorch.org/whl/cu128."
+                )
+            # Execute a real kernel now so an incompatible wheel fails once at
+            # startup instead of once per processed video frame.
+            torch.zeros(1, device="cuda").add_(1)
+            torch.cuda.synchronize()
+
         model_config = _ENHANCER_MODELS[settings.face_enhancer_model]
-        logger.info("Face enhancer model: %s", settings.face_enhancer_model)
+        logger.info("Face enhancer model: %s (device=%s)", settings.face_enhancer_model, device)
 
         return GFPGANer(
             model_path=model_config["model_path"],
@@ -120,8 +164,13 @@ def _load_face_enhancer():
 
 def get_engine():
     """Thread-safe lazy init so the (slow) model load happens once, on first request."""
-    global _face_analyser, _face_swapper, _face_enhancer
-    if _face_analyser is None or _face_swapper is None:
+    global _face_analyser, _face_swapper, _face_enhancer, _face_enhancer_disabled_reason
+    needs_enhancer = (
+        settings.enable_face_enhancer
+        and _face_enhancer is None
+        and _face_enhancer_disabled_reason is None
+    )
+    if _face_analyser is None or _face_swapper is None or needs_enhancer:
         with _lock:
             if _face_analyser is None:
                 logger.info("Loading face analyser (buffalo_l)...")
@@ -129,9 +178,15 @@ def get_engine():
             if _face_swapper is None:
                 logger.info("Loading face swapper (inswapper_128)...")
                 _face_swapper = _load_face_swapper()
-            if _face_enhancer is None and settings.enable_face_enhancer:
+            if (
+                settings.enable_face_enhancer
+                and _face_enhancer is None
+                and _face_enhancer_disabled_reason is None
+            ):
                 logger.info("Loading face enhancer (%s)...", settings.face_enhancer_model)
                 _face_enhancer = _load_face_enhancer()
+                if _face_enhancer is None:
+                    _face_enhancer_disabled_reason = "enhancer initialization failed"
     return _face_analyser, _face_swapper, _face_enhancer
 
 
@@ -433,6 +488,12 @@ def swap_face_in_frame(
         try:
             result = _apply_face_enhancer(result, face_enhancer, target_face)
         except Exception as exc:  # pragma: no cover - enhancer is best-effort
-            logger.warning("Face enhancement failed on a frame, using raw swap: %s", exc)
+            global _face_enhancer, _face_enhancer_disabled_reason
+            logger.exception(
+                "Face enhancement failed; disabling enhancer for this worker process "
+                "and using raw swaps for remaining frames: %s", exc
+            )
+            _face_enhancer = None
+            _face_enhancer_disabled_reason = str(exc)
 
     return result

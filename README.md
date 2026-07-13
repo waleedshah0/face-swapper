@@ -411,11 +411,15 @@ not an app bug.
 **`gfpgan`/`basicsr` import error mentioning `torchvision.transforms.functional_tensor`**
 `basicsr==1.4.2` (a GFPGAN dependency) was written against an older
 torchvision and breaks on torchvision releases that removed that module.
-This only affects the *optional* face enhancer — `face_engine.py` already
-catches this and logs a warning instead of crashing, so the app keeps
-working without enhancement. To actually fix it: either install an older
-`torchvision` (`pip install "torchvision<0.17"`) in the same environment,
-or set `ENABLE_FACE_ENHANCER=false` in `.env` and skip it entirely.
+`app/core/face_engine.py:_patch_torchvision_functional_tensor()` works
+around this automatically (aliases the missing module to
+`torchvision.transforms.functional`, which still has everything basicsr
+needs under the same names) — you shouldn't need to do anything for this
+one. If you still see it, you're likely running an older build; rebuild
+and redeploy. Even without the patch, this only affects the *optional*
+face enhancer — `face_engine.py` catches the failure and logs a warning
+instead of crashing, so the app keeps working without enhancement either
+way.
 
 **Model load is slow on every job, not just the first one**
 That means something is re-creating the `FaceAnalysis`/swapper objects

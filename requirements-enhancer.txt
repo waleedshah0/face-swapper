@@ -1,5 +1,14 @@
-# Optional. Install with: pip install -r requirements-enhancer.txt
+# Optional. Install together with requirements.txt in ONE pip invocation:
+#   pip install -r requirements.txt -r requirements-enhancer.txt
 # Only needed if you set ENABLE_FACE_ENHANCER=true in .env.
+#
+# Installing this file as a SEPARATE `pip install` after requirements.txt
+# will silently upgrade numpy past the <2.0.0 pin in requirements.txt
+# (gfpgan/basicsr/facexlib pull in an unpinned numpy), breaking insightface
+# and torch's compiled extensions at runtime ("A module that was compiled
+# using NumPy 1.x cannot be run in NumPy 2.x" / "Numpy is not available").
+# The explicit numpy pin below is a second line of defense either way.
+numpy>=1.26.0,<2.0.0
 #
 # Known issue: basicsr==1.4.2's setup.py fails to build on newer Python
 # (3.12+, confirmed broken on 3.13/3.14) with "KeyError: '__version__'" —
@@ -12,3 +21,13 @@
 gfpgan==1.3.8
 basicsr==1.4.2
 facexlib==0.3.0
+# torchvision pulls in torch (and, on a fresh install, several GB of CUDA
+# wheels — cublas/cudnn/cufft/etc. — even in a GPU container that already
+# has CUDA/cuDNN from the base image, since PyPI's default torch wheel
+# bundles its own copies as separate pip dependencies). Only needed here,
+# never by the core swap pipeline — see the note in requirements.txt.
+# Blackwell (sm_120) requires PyTorch wheels built with CUDA 12.8+.
+# Keep torch/torchvision paired and fetch them from PyTorch's CUDA 12.8 index.
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.7.1+cu128
+torchvision==0.22.1+cu128

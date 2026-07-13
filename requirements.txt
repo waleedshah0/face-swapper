@@ -15,8 +15,14 @@ numpy>=1.26.0,<2.0.0
 
 # Optional face restoration/enhancement (better quality, slower) — install
 # separately from requirements-enhancer.txt if you want it. Kept out of this
-# file because basicsr (a gfpgan dependency) has a broken setup.py on newer
-# Python and will fail the whole install otherwise. See README troubleshooting.
+# file because (a) basicsr (a gfpgan dependency) has a broken setup.py on
+# newer Python and will fail the whole install otherwise, and (b) torch
+# alone pulls several GB of CUDA wheels (cublas/cudnn/cufft/etc.) that a
+# plain (non-enhancer) install has no reason to pay for. See README
+# troubleshooting. torchvision (which pulls in torch) lives in
+# requirements-enhancer.txt for the same reason — it's only ever imported
+# by app/core/face_engine.py's enhancer path, never by the core swap
+# pipeline (insightface + onnxruntime).
 
 # Video <-> audio muxing (requires the ffmpeg binary installed on the system too)
 ffmpeg-python==0.2.0
@@ -24,8 +30,6 @@ ffmpeg-python==0.2.0
 # Utilities
 python-dotenv==1.0.1
 aiofiles==23.2.1
-
-torchvision==0.17.2
 
 # Job queue (RabbitMQ) + status cache (Redis) — see app/broker.py, app/store.py, app/worker.py
 pika==1.3.2
