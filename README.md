@@ -11,11 +11,11 @@ shared uploads folder and just needs the swap done.
 
 ```
 Caller (website/mobile server)
-   │  POST /api/swap  (XML: OriginalSource, SwapSource, optional TargetSource)
+   │  POST /api/swap  (XML: SiteId, OriginalSource, SwapSource, optional TargetSource)
    ▼
 FastAPI (app/main.py)
-   │  validate payload → generate job_id → write status "Starting" to Redis → publish job to RabbitMQ
-   │  responds 202 immediately with {job_id, media_type, status}
+   │  validate payload → generate job_id → write status "Starting" (+ site_id) to Redis → publish job to RabbitMQ
+   │  responds 202 immediately with {job_id, site_id, media_type, status}
    ▼
 RabbitMQ (swap_jobs queue)
    ▼
@@ -24,6 +24,7 @@ Worker process(es) (app/worker.py) — one or more, scale horizontally
    │  app/core/face_engine.py   (InsightFace detector + inswapper_128)
    │  app/core/image_swap.py / app/core/video_swap.py (frame loop + ffmpeg audio mux)
    │  status → "Completed" (+ output_file) or "Failed" (+ message)
+   │  on "Completed": POST the job's record (JSON) to COMPLETION_WEBHOOK_URL (best-effort)
    ▼
 Redis (status cache, keyed by job_id)
    ▲
@@ -213,8 +214,13 @@ consider changing the default `guest`/`guest` credentials.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/api/swap` | `application/xml`: `<SwapRequest><OriginalSource/><SwapSource/><TargetSource/></SwapRequest>` | Validates the payload, generates a `job_id`, queues the job, returns `202` with `{job_id, media_type, status}` immediately. Does not wait for the swap to finish. |
+| POST | `/api/swap` | `application/xml`: `<SwapRequest><SiteId/><OriginalSource/><SwapSource/><TargetSource/></SwapRequest>` | Validates the payload, generates a `job_id`, queues the job, returns `202` with `{job_id, site_id, media_type, status}` immediately. Does not wait for the swap to finish. |
 | GET | `/api/swap/{job_id}` | — | Returns the job's current status as a single JSON response and closes immediately. Not a stream — poll it again whenever you want the next update. |
+
+`SiteId` is a caller-supplied string identifying which site/tenant the job
+belongs to — it's required, stored alongside the job's status record in
+Redis, and echoed back in `site_id` on every response for that job (both
+`POST /api/swap` and `GET /api/swap/{job_id}`).
 
 `OriginalSource`, `SwapSource`, and `TargetSource` are filenames expected to
 already exist in `settings.uploads_dir` (the shared folder the
@@ -230,6 +236,35 @@ there's no caller-supplied id to de-duplicate against, every `POST
 `OriginalSource`/`SwapSource` — retry logic on the caller's side needs to
 account for that (e.g. don't blindly retry on timeout without checking
 whether the first request actually landed).
+
+### Completion webhook
+
+Once a job's status has been written to Redis as `Completed` (100% done),
+`app/worker.py` POSTs that job's just-updated cache record as the JSON body
+to `COMPLETION_WEBHOOK_URL` — the same fields `GET /api/swap/{job_id}` would
+return, so the receiver doesn't need a separate poll to find out what
+finished:
+
+```bash
+curl --header "Content-Type: application/json" \
+  --request POST \
+  --data '{"job_id": "...", "site_id": "site123", "original_source": "video1.mp4", "swap_source": "image2.jpg", "target_source": null, "media_type": "video", "status": "Completed", "message": null, "output_file": "....mp4", "created_at": "...", "updated_at": "..."}' \
+  $COMPLETION_WEBHOOK_URL
+```
+
+`COMPLETION_WEBHOOK_URL` has **no default in code** (`app/config.py`) —
+it's only ever read from `.env`, so changing which URL gets called (e.g.
+pointing at a different environment or test endpoint) is always a `.env`
+edit, never a code change or rebuild. Leave it empty/unset to disable the
+webhook entirely.
+
+This is best-effort (`app/worker.py:_send_completion_webhook()`) — a
+failed or slow webhook is logged as a warning and never affects the job's
+own status, which is already final by that point. It only fires on success
+(`Completed`), not on `Failed`. If the Redis write itself failed (so there's
+no record to send), it falls back to just `{"job_id", "site_id"}`.
+`COMPLETION_WEBHOOK_TIMEOUT_SECONDS` (default `10`) caps how long the
+worker waits on it.
 
 ### Which face gets swapped (multi-face photos and videos)
 
@@ -271,13 +306,13 @@ Example (`curl`):
 # default target (first female face):
 curl -X POST http://localhost:8000/api/swap \
   -H "Content-Type: application/xml" \
-  -d '<SwapRequest><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource></SwapRequest>'
+  -d '<SwapRequest><SiteId>site123</SiteId><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource></SwapRequest>'
 
 # specific person via TargetSource:
 curl -X POST http://localhost:8000/api/swap \
   -H "Content-Type: application/xml" \
-  -d '<SwapRequest><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource><TargetSource>dipika.jpg</TargetSource></SwapRequest>'
-# -> {"job_id": "...", "media_type": "video", "status": "Starting"}
+  -d '<SwapRequest><SiteId>site123</SiteId><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource><TargetSource>dipika.jpg</TargetSource></SwapRequest>'
+# -> {"job_id": "...", "site_id": "site123", "media_type": "video", "status": "Starting"}
 
 curl http://localhost:8000/api/swap/<job_id-from-above>
 ```
@@ -500,9 +535,12 @@ worker's per-frame log lines:
   "bad input, don't retry" from "infra hiccup, retry a few times," wire up
   a dead-letter exchange and have the worker `basic_nack` on infra-type
   errors specifically.
-- **Push instead of poll**: if you'd rather not poll `GET /api/swap/{job_id}`,
-  the natural next step is a webhook — add a `CallbackUrl` to `SwapRequest`
-  and have `app/worker.py` POST status updates to it as they happen.
+- **Push instead of poll**: a fixed completion webhook already fires on
+  every `Completed` job (see "Completion webhook" above). If you want
+  per-request callback URLs instead of one fixed `COMPLETION_WEBHOOK_URL`,
+  or updates on `In progress`/`Failed` too, the natural next step is adding
+  a `CallbackUrl` to `SwapRequest` and having `app/worker.py` POST to that
+  instead of/in addition to the fixed URL.
 - **Caller-supplied idempotency key**: if you need retry-safe de-duplication
   again (e.g. a caller-supplied `TransId` that maps to a `job_id`), that's a
   small addition on top of the current job_id-only design — add the field

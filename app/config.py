@@ -79,6 +79,18 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     request_record_ttl_seconds: int = Field(default=86400, alias="REQUEST_RECORD_TTL_SECONDS")
 
+    # Fired by app/worker.py once a job's status has been written to Redis
+    # as Completed (100% done) — POSTs that job's cache record (job_id,
+    # site_id, sources, status, output_file, timestamps, ...) as JSON,
+    # best-effort (a failed/slow webhook never fails the job itself).
+    #
+    # No default on purpose: this URL only ever comes from .env, so
+    # changing it (e.g. pointing at a different environment/test endpoint)
+    # is always a config edit, never a code edit. Unset/empty disables the
+    # webhook entirely (app/worker.py:_send_completion_webhook() no-ops).
+    completion_webhook_url: str = Field(default="", alias="COMPLETION_WEBHOOK_URL")
+    completion_webhook_timeout_seconds: int = Field(default=10, alias="COMPLETION_WEBHOOK_TIMEOUT_SECONDS")
+
     @field_validator("execution_provider")
     @classmethod
     def normalize_execution_provider(cls, value: str) -> str:
@@ -99,6 +111,7 @@ class Settings(BaseSettings):
         "face_detector_size",
         "rabbitmq_prefetch_count",
         "request_record_ttl_seconds",
+        "completion_webhook_timeout_seconds",
     )
     @classmethod
     def validate_positive_int(cls, value: int) -> int:

@@ -42,9 +42,13 @@ another thread.
 """
 from __future__ import annotations
 
+import json
 import logging
 import signal
 import threading
+import urllib.error
+import urllib.request
+from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
 
@@ -59,6 +63,7 @@ from app.store import (
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_IN_PROGRESS,
+    RequestRecord,
     RequestStore,
     RequestStoreError,
     get_store,
@@ -130,14 +135,50 @@ def _run_swap(store: RequestStore, job: SwapJobMessage) -> Path:
     return output_path
 
 
-def _mark_completed(store: RequestStore, job: SwapJobMessage, output_path: Path) -> None:
+def _send_completion_webhook(job: SwapJobMessage, record: Optional[RequestRecord]) -> None:
+    """
+    Best-effort "job finished" ping, fired once the job's status has been
+    written to Redis as Completed (100% done). POSTs the just-updated cache
+    record for this job_id (job_id, site_id, sources, status, output_file,
+    timestamps, ...) as the JSON body, so the receiver doesn't need to call
+    GET /api/swap/{job_id} separately to find out what finished. Falls back
+    to just {"job_id", "site_id"} if the record couldn't be read back (e.g.
+    Redis write failed) — the job's own success/failure is already final by
+    this point either way, and this never raises. Set COMPLETION_WEBHOOK_URL
+    to an empty string in .env to disable.
+    """
+    url = settings.completion_webhook_url
+    if not url:
+        return
+    payload = asdict(record) if record is not None else {"job_id": job.job_id, "site_id": job.site_id}
     try:
-        store.update_status(job.job_id, STATUS_COMPLETED, output_file=output_path.name)
+        data=json.dumps(payload).encode("utf-8")
+        print(data)
+        request = urllib.request.Request(
+            url,
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=settings.completion_webhook_timeout_seconds) as response:
+            response.read()
+        logger.info(
+            "Sent completion webhook for job_id=%s (site_id=%s) -> %s", job.job_id, job.site_id, url
+        )
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Completion webhook failed for job_id=%s: %s", job.job_id, exc)
+
+
+def _mark_completed(store: RequestStore, job: SwapJobMessage, output_path: Path) -> None:
+    record: Optional[RequestRecord] = None
+    try:
+        record = store.update_status(job.job_id, STATUS_COMPLETED, output_file=output_path.name)
     except RequestStoreError:
         logger.exception(
             "Swap for job_id=%s succeeded but the status cache couldn't be updated", job.job_id
         )
     logger.info("Completed job_id=%s -> %s", job.job_id, output_path.name)
+    _send_completion_webhook(job, record)
 
 
 def _mark_failed(store: RequestStore, job: SwapJobMessage, message: str) -> None:

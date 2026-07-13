@@ -50,6 +50,7 @@ def _now_iso() -> str:
 @dataclass
 class RequestRecord:
     job_id: str
+    site_id: str
     original_source: str
     swap_source: str
     media_type: str
@@ -81,6 +82,7 @@ class RequestStore:
     def create(
         self,
         job_id: str,
+        site_id: str,
         original_source: str,
         swap_source: str,
         media_type: str,
@@ -89,6 +91,7 @@ class RequestStore:
         """Create (or overwrite) a record with status STARTING."""
         record = RequestRecord(
             job_id=job_id,
+            site_id=site_id,
             original_source=original_source,
             swap_source=swap_source,
             media_type=media_type,

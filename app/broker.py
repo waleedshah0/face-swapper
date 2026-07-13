@@ -35,6 +35,7 @@ class BrokerError(Exception):
 @dataclass
 class SwapJobMessage:
     job_id: str                     # server-generated in app/main.py; the sole job identifier
+    site_id: str                    # caller-supplied; identifies which site/tenant this job belongs to
     original_source: str
     swap_source: str
     media_type: str                 # "image" or "video"
