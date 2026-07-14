@@ -16,16 +16,26 @@ class Settings(BaseSettings):
 
     execution_provider: str = Field(default="cpu", alias="EXECUTION_PROVIDER")
     swapper_model_path: str = Field(default="models/inswapper_128.onnx", alias="SWAPPER_MODEL_PATH")
-    enable_face_enhancer: bool = Field(default=False, alias="ENABLE_FACE_ENHANCER")
 
-    # Which restoration model GFPGANer loads (both come from the already-
-    # installed `gfpgan` package, no extra dependency either way):
-    #   "gfpgan"        - GFPGANv1.4 (the original default here).
-    #   "restoreformer" - RestoreFormer (Apache 2.0, same license terms as
-    #                     GFPGAN itself). Generally a step up in identity
-    #                     preservation and detail over GFPGAN, at similar
-    #                     speed. See app/core/face_engine.py:_load_face_enhancer().
-    face_enhancer_model: str = Field(default="gfpgan", alias="FACE_ENHANCER_MODEL")
+    # Each restoration model is toggled independently via its own .env flag
+    # — both ship inside the already-installed `gfpgan` package (no extra
+    # dependency either way) and are Apache 2.0 (commercial-safe). Whether
+    # the enhancer runs at all, and which model(s), is entirely decided by
+    # these two flags (there is no separate master ENABLE_FACE_ENHANCER
+    # switch anymore):
+    #
+    #   ENABLE_GFPGAN=true,  ENABLE_RESTOREFORMER=true  -> both run, chained:
+    #       GFPGAN restores first, then RestoreFormer refines its output.
+    #       Strongest result, slowest (two model passes per frame).
+    #   ENABLE_GFPGAN=true,  ENABLE_RESTOREFORMER=false -> GFPGAN only.
+    #   ENABLE_GFPGAN=false, ENABLE_RESTOREFORMER=true  -> RestoreFormer only
+    #       (generally better identity preservation/detail than GFPGAN alone).
+    #   ENABLE_GFPGAN=false, ENABLE_RESTOREFORMER=false -> no enhancement at
+    #       all — raw swap output, fastest.
+    #
+    # See app/core/face_engine.py:_load_face_enhancers().
+    enable_gfpgan: bool = Field(default=False, alias="ENABLE_GFPGAN")
+    enable_restoreformer: bool = Field(default=False, alias="ENABLE_RESTOREFORMER")
 
     # inswapper_128 doesn't correct for skin-tone/lighting mismatch between
     # the pasted face and the frame it lands in ("pasted on" look). This
@@ -79,19 +89,30 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://localhost:6379/0", alias="REDIS_URL")
     request_record_ttl_seconds: int = Field(default=86400, alias="REQUEST_RECORD_TTL_SECONDS")
 
+    # Fired by app/worker.py once a job's status has been written to Redis
+    # as Completed (100% done) — POSTs that job's cache record (job_id,
+    # site_id, sources, status, output_file, timestamps, ...) as JSON,
+    # best-effort (a failed/slow webhook never fails the job itself).
+    #
+    # The URL is per-SiteId: {site_id} in this template is substituted with
+    # the job's own SiteId. E.g. with the default template, a job with
+    # SiteId "csw102w" gets its webhook posted to
+    # https://csw102w.cs4m.com/face_swap/response/. See
+    # app/worker.py:_completion_webhook_url_for().
+    #
+    # Only the template lives in .env, so pointing at a different domain is
+    # always a config edit, never a code edit. Leave empty to disable the
+    # webhook entirely (app/worker.py:_send_completion_webhook() no-ops).
+    completion_webhook_url_template: str = Field(
+        default="https://{site_id}.cs4m.com/face_swap/response/",
+        alias="COMPLETION_WEBHOOK_URL_TEMPLATE",
+    )
+    completion_webhook_timeout_seconds: int = Field(default=10, alias="COMPLETION_WEBHOOK_TIMEOUT_SECONDS")
+
     @field_validator("execution_provider")
     @classmethod
     def normalize_execution_provider(cls, value: str) -> str:
         return value.strip().lower()
-
-    @field_validator("face_enhancer_model")
-    @classmethod
-    def validate_face_enhancer_model(cls, value: str) -> str:
-        normalized = value.strip().lower()
-        allowed = {"gfpgan", "restoreformer"}
-        if normalized not in allowed:
-            raise ValueError(f"FACE_ENHANCER_MODEL must be one of {sorted(allowed)}")
-        return normalized
 
     @field_validator(
         "max_image_mb",
@@ -99,6 +120,7 @@ class Settings(BaseSettings):
         "face_detector_size",
         "rabbitmq_prefetch_count",
         "request_record_ttl_seconds",
+        "completion_webhook_timeout_seconds",
     )
     @classmethod
     def validate_positive_int(cls, value: int) -> int:
@@ -137,6 +159,11 @@ class Settings(BaseSettings):
         p = Path(self.storage_dir) / "jobs"
         p.mkdir(parents=True, exist_ok=True)
         return p
+
+    @property
+    def enable_face_enhancer(self) -> bool:
+        """True if at least one restoration model (GFPGAN and/or RestoreFormer) is enabled."""
+        return self.enable_gfpgan or self.enable_restoreformer
 
     @property
     def use_cuda(self) -> bool:
