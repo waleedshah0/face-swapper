@@ -42,7 +42,6 @@ another thread.
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
 import signal
@@ -52,6 +51,7 @@ import urllib.request
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
+from xml.etree import ElementTree as ET
 
 from pika.adapters.blocking_connection import BlockingChannel, BlockingConnection
 
@@ -164,24 +164,64 @@ def _completion_webhook_url_for(site_id: str) -> Optional[str]:
     return template.format(site_id=site_id)
 
 
+# Maps RequestRecord/asdict() field names to the XML tag names used in the
+# webhook body. PascalCase to mirror the <SwapRequest> XML a caller POSTs to
+# /api/swap in the first place (SiteId, OriginalSource, SwapSource,
+# TargetSource are literally the same tag names used there).
+_WEBHOOK_XML_TAGS = {
+    "job_id": "JobId",
+    "site_id": "SiteId",
+    "original_source": "OriginalSource",
+    "swap_source": "SwapSource",
+    "media_type": "MediaType",
+    "target_source": "TargetSource",
+    "status": "Status",
+    "message": "Message",
+    "output_file": "OutputFile",
+    "created_at": "CreatedAt",
+    "updated_at": "UpdatedAt",
+}
+
+
+def _payload_to_xml(payload: dict) -> bytes:
+    """
+    Serialize a completion webhook payload (a RequestRecord's fields, or the
+    {"job_id", "site_id"} fallback) as XML rather than JSON, under a root
+    <SwapResponse> element — see _WEBHOOK_XML_TAGS for the field->tag
+    mapping. Missing/None values are sent as empty elements (e.g.
+    <TargetSource/>), matching how an omitted optional field looks in the
+    original request XML. Built with ElementTree rather than string
+    formatting so field values are properly XML-escaped.
+    """
+    root = ET.Element("SwapResponse")
+    for key, tag in _WEBHOOK_XML_TAGS.items():
+        if key not in payload:
+            continue
+        value = payload[key]
+        element = ET.SubElement(root, tag)
+        element.text = "" if value is None else str(value)
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
 def _send_completion_webhook(job: SwapJobMessage, record: Optional[RequestRecord]) -> None:
     """
     Best-effort "job finished" ping, fired once the job's status has been
     written to Redis as Completed (100% done). POSTs the just-updated cache
     record for this job_id (job_id, site_id, sources, status, output_file,
-    timestamps, ...) as the JSON body to this job's per-SiteId URL (see
-    _completion_webhook_url_for()), so the receiver doesn't need to call
-    GET /api/swap/{job_id} separately to find out what finished. Falls back
-    to just {"job_id", "site_id"} if the record couldn't be read back (e.g.
-    Redis write failed) — the job's own success/failure is already final by
-    this point either way, and this never raises. Leave
-    COMPLETION_WEBHOOK_URL_TEMPLATE empty in .env to disable.
+    timestamps, ...) as an XML body (see _payload_to_xml()) to this job's
+    per-SiteId URL (see _completion_webhook_url_for()), so the receiver
+    doesn't need to call GET /api/swap/{job_id} separately to find out what
+    finished. Falls back to just {"job_id", "site_id"} if the record
+    couldn't be read back (e.g. Redis write failed) — the job's own
+    success/failure is already final by this point either way, and this
+    never raises. Leave COMPLETION_WEBHOOK_URL_TEMPLATE empty in .env to
+    disable.
     """
     url = _completion_webhook_url_for(job.site_id)
     if not url:
         return
     payload = asdict(record) if record is not None else {"job_id": job.job_id, "site_id": job.site_id}
-    data = json.dumps(payload).encode("utf-8")
+    data = _payload_to_xml(payload)
     logger.info(
         "Completion webhook payload for job_id=%s (site_id=%s) -> %s: %s",
         job.job_id, job.site_id, url, data.decode("utf-8"),
@@ -190,7 +230,7 @@ def _send_completion_webhook(job: SwapJobMessage, record: Optional[RequestRecord
         request = urllib.request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/xml"},
             method="POST",
         )
         with urllib.request.urlopen(request, timeout=settings.completion_webhook_timeout_seconds) as response:

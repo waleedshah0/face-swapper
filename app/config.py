@@ -91,8 +91,10 @@ class Settings(BaseSettings):
 
     # Fired by app/worker.py once a job's status has been written to Redis
     # as Completed (100% done) — POSTs that job's cache record (job_id,
-    # site_id, sources, status, output_file, timestamps, ...) as JSON,
-    # best-effort (a failed/slow webhook never fails the job itself).
+    # site_id, sources, status, output_file, timestamps, ...) as XML (a
+    # <SwapResponse> body, mirroring the <SwapRequest> XML the caller
+    # originally POSTed to /api/swap), best-effort (a failed/slow webhook
+    # never fails the job itself).
     #
     # The URL is per-SiteId: {site_id} in this template is substituted with
     # the job's own SiteId. E.g. with the default template, a job with

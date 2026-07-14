@@ -24,7 +24,7 @@ Worker process(es) (app/worker.py) — one or more, scale horizontally
    │  app/core/face_engine.py   (InsightFace detector + inswapper_128)
    │  app/core/image_swap.py / app/core/video_swap.py (frame loop + ffmpeg audio mux)
    │  status → "Completed" (+ output_file) or "Failed" (+ message)
-   │  on "Completed": POST the job's record (JSON) to this job's per-SiteId webhook URL (best-effort)
+   │  on "Completed": POST the job's record (XML) to this job's per-SiteId webhook URL (best-effort)
    ▼
 Redis (status cache, keyed by job_id)
    ▲
@@ -62,8 +62,9 @@ pip install -r requirements.txt
 ```
 
 If you get a GPU later: change `onnxruntime` to `onnxruntime-gpu` in
-`requirements.txt`, set `EXECUTION_PROVIDER=cuda` in `.env`, and use
-`Dockerfile.gpu` instead of `Dockerfile` (or see "Deploying to a server").
+`requirements.txt` and set `EXECUTION_PROVIDER=cuda` in `.env` — `Dockerfile`
+is already CUDA-based (`nvidia/cuda` base image), so no separate GPU
+Dockerfile is needed; see "Deploying to a server" below.
 
 If you want to run everything on GPU, also install the optional enhancer
 requirements with `pip install -r requirements-enhancer.txt` and set
@@ -159,8 +160,8 @@ instead of `uvicorn`. Only the worker needs `--gpus`.
 **1. Build and push (same as before):**
 
 ```bash
-docker build -t dev1shayansolutions/faceswapper:v1 .
-docker push dev1shayansolutions/faceswapper:v1
+$ docker build --build-arg INSTALL_ENHANCER=true -t dev1shayansolutions/faceswapper:v9 .
+docker push dev1shayansolutions/faceswapper:v9
 ```
 
 **2. On the server**, create a directory (e.g. `/opt/faceswap-app/`) with
@@ -197,13 +198,18 @@ no GPU), and the worker (with `--gpus`) together, wired to talk to each
 other, with the same `/mnt/gpu/send_to_gpu` / `/mnt/gpu/receive_from_gpu`
 bind mounts your old command used.
 
-**Rolling out a new version:** build + push a new tag as before, then on
-the server:
+**Rolling out a new version:** build + push a new tag, update the `image:`
+line(s) in `docker-compose.prod.yml` on the server to that tag, then:
 
 ```bash
 docker compose -f docker-compose.prod.yml pull
-docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml up -d --force-recreate
 ```
+
+`--force-recreate` guarantees the `api` and `worker` containers are actually
+replaced with the new image even if compose thinks nothing changed (e.g. the
+tag was reused) — cheap insurance against redeploying and still running the
+old code.
 
 **Security note:** `docker-compose.prod.yml` binds RabbitMQ's and Redis's
 ports to `127.0.0.1` only (containers still reach each other over the
@@ -250,8 +256,10 @@ whether the first request actually landed).
 ### Completion webhook
 
 Once a job's status has been written to Redis as `Completed` (100% done),
-`app/worker.py` POSTs that job's just-updated cache record as the JSON body
-to a URL built from `COMPLETION_WEBHOOK_URL_TEMPLATE` — the same fields
+`app/worker.py` POSTs that job's just-updated cache record as an **XML**
+body — a `<SwapResponse>` element, mirroring the `<SwapRequest>` XML the
+caller originally POSTed to `/api/swap` — to a URL built from
+`COMPLETION_WEBHOOK_URL_TEMPLATE`. It carries the same fields
 `GET /api/swap/{job_id}` would return, so the receiver doesn't need a
 separate poll to find out what finished.
 
@@ -262,11 +270,16 @@ the job's own `SiteId`. With the default template
 `https://csw102w.cs4m.com/face_swap/response/`:
 
 ```bash
-curl --header "Content-Type: application/json" \
+curl --header "Content-Type: application/xml" \
   --request POST \
-  --data '{"job_id": "...", "site_id": "csw102w", "original_source": "video1.mp4", "swap_source": "image2.jpg", "target_source": null, "media_type": "video", "status": "Completed", "message": null, "output_file": "....mp4", "created_at": "...", "updated_at": "..."}' \
+  --data '<?xml version="1.0" encoding="utf-8"?>
+<SwapResponse><JobId>...</JobId><SiteId>csw102w</SiteId><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource><MediaType>video</MediaType><TargetSource></TargetSource><Status>Completed</Status><Message></Message><OutputFile>....mp4</OutputFile><CreatedAt>...</CreatedAt><UpdatedAt>...</UpdatedAt></SwapResponse>' \
   https://csw102w.cs4m.com/face_swap/response/
 ```
+
+Field-to-tag mapping and empty/missing-value handling (`None` -> empty
+element, e.g. `<TargetSource/>`) live in
+`app/worker.py:_WEBHOOK_XML_TAGS` / `_payload_to_xml()`.
 
 `COMPLETION_WEBHOOK_URL_TEMPLATE` is only ever read from `.env`, so pointing
 at a different domain/pattern is always a `.env` edit, never a code change
@@ -280,10 +293,11 @@ This is best-effort (`app/worker.py:_send_completion_webhook()`) — a
 failed or slow webhook is logged as a warning and never affects the job's
 own status, which is already final by that point. It only fires on success
 (`Completed`), not on `Failed`. If the Redis write itself failed (so there's
-no record to send), it falls back to just `{"job_id", "site_id"}`. The
-outgoing JSON payload is always logged (`logger.info`) before the request is
-sent, regardless of whether it succeeds. `COMPLETION_WEBHOOK_TIMEOUT_SECONDS`
-(default `10`) caps how long the worker waits on it.
+no record to send), it falls back to just `<SwapResponse>` with `<JobId>`
+and `<SiteId>` only. The outgoing XML payload is always logged
+(`logger.info`) before the request is sent, regardless of whether it
+succeeds. `COMPLETION_WEBHOOK_TIMEOUT_SECONDS` (default `10`) caps how long
+the worker waits on it.
 
 ### Which face gets swapped (multi-face photos and videos)
 
