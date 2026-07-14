@@ -11,6 +11,11 @@ Keyed by job_id — the id app/main.py generates for every POST /api/swap and
 hands back to the caller — so GET /api/swap/{job_id} is an O(1) lookup.
 Records expire after settings.request_record_ttl_seconds so the cache
 doesn't grow unbounded.
+
+SiteId (caller-supplied) must be unique among active records — a second
+POST /api/swap with a SiteId that's still cached is rejected with
+SiteIdConflictError (see RequestStore.create()) rather than creating a
+second job under it.
 """
 from __future__ import annotations
 
@@ -38,9 +43,18 @@ TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED}
 
 _KEY_PREFIX = "faceswap:request:"
 
+# Secondary index enforcing SiteId uniqueness: value is the job_id that
+# claimed it, same TTL as the job record itself, so a SiteId frees up again
+# once its job record would have expired anyway. See RequestStore.create().
+_SITE_KEY_PREFIX = "faceswap:site:"
+
 
 class RequestStoreError(Exception):
     """Raised when the status cache can't be reached or written to."""
+
+
+class SiteIdConflictError(Exception):
+    """Raised when a SiteId already has an active (non-expired) record in the cache."""
 
 
 def _now_iso() -> str:
@@ -79,6 +93,21 @@ class RequestStore:
     def _key(self, job_id: str) -> str:
         return f"{_KEY_PREFIX}{job_id}"
 
+    def _site_key(self, site_id: str) -> str:
+        return f"{_SITE_KEY_PREFIX}{site_id}"
+
+    def site_id_exists(self, site_id: str) -> bool:
+        """
+        Fast-path check: does this SiteId already have an active record?
+        Cheap (single Redis EXISTS), meant to let a caller reject an obvious
+        duplicate before doing other work (file validation, etc.) — the
+        authoritative, race-safe check is the atomic claim inside create().
+        """
+        try:
+            return bool(self._client.exists(self._site_key(site_id)))
+        except redis.RedisError as exc:
+            raise RequestStoreError(f"Could not check SiteId={site_id!r} for uniqueness") from exc
+
     def create(
         self,
         job_id: str,
@@ -88,7 +117,26 @@ class RequestStore:
         media_type: str,
         target_source: Optional[str] = None,
     ) -> RequestRecord:
-        """Create (or overwrite) a record with status STARTING."""
+        """
+        Create (or overwrite) a record with status STARTING.
+
+        SiteId must be unique among active (non-expired) records. Enforced
+        here atomically via Redis SETNX (set-if-not-exists) rather than a
+        separate check-then-set, so two concurrent requests with the same
+        SiteId can't both slip through a race — whichever call reaches
+        Redis first wins the claim, the other raises SiteIdConflictError.
+        The claim shares this record's TTL, so the SiteId becomes available
+        again once the record would have expired anyway.
+        """
+        try:
+            claimed = self._client.set(
+                self._site_key(site_id), job_id, nx=True, ex=self._ttl_seconds
+            )
+        except redis.RedisError as exc:
+            raise RequestStoreError(f"Could not claim SiteId={site_id!r}") from exc
+        if not claimed:
+            raise SiteIdConflictError(f"SiteId '{site_id}' already exists.")
+
         record = RequestRecord(
             job_id=job_id,
             site_id=site_id,

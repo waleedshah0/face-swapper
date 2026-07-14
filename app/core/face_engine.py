@@ -18,7 +18,7 @@ from __future__ import annotations
 import logging
 import threading
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -30,7 +30,11 @@ logger = logging.getLogger("faceswap.engine")
 _lock = threading.Lock()
 _face_analyser = None
 _face_swapper = None
-_face_enhancer = None
+# None = not yet attempted. Once attempted, a list of (name, GFPGANer
+# instance) for whichever of ENABLE_GFPGAN/ENABLE_RESTOREFORMER loaded
+# successfully — possibly empty if nothing is enabled or everything enabled
+# failed to load. See _load_face_enhancers().
+_face_enhancers = None
 _face_enhancer_disabled_reason = None
 
 
@@ -73,9 +77,10 @@ def _load_face_swapper():
 
 
 # Both restoration models below ship inside the already-installed `gfpgan`
-# package (GFPGANer just takes a different `arch` + checkpoint), so picking
-# either one needs no new dependency. See FACE_ENHANCER_MODEL in config.py
-# for the tradeoffs.
+# package (GFPGANer just takes a different `arch` + checkpoint), so enabling
+# either (or both) needs no new dependency. See ENABLE_GFPGAN /
+# ENABLE_RESTOREFORMER in config.py for the tradeoffs. Order here also
+# defines chain order when both are enabled — see _load_face_enhancers().
 _ENHANCER_MODELS = {
     "gfpgan": {
         "arch": "clean",
@@ -110,64 +115,104 @@ def _patch_torchvision_functional_tensor() -> None:
     sys.modules["torchvision.transforms.functional_tensor"] = _functional
 
 
-def _load_face_enhancer():
-    """Optional GAN-based restoration pass to sharpen/clean the swapped face."""
-    if not settings.enable_face_enhancer:
-        return None
+def _check_cuda_enhancer_readiness(torch) -> None:
+    """
+    Raises if the installed PyTorch wheel doesn't include compiled kernels
+    for this GPU's compute capability — better to fail once here, at model
+    load, than once per processed frame. Also runs one real kernel so an
+    incompatible wheel fails immediately rather than on the first frame.
+    """
+    major, minor = torch.cuda.get_device_capability(0)
+    required_arch = f"sm_{major}{minor}"
+    compiled_arches = set(torch.cuda.get_arch_list())
+    logger.info(
+        "Enhancer PyTorch=%s, CUDA runtime=%s, GPU=%s (%s), compiled_arches=%s",
+        torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0),
+        required_arch, sorted(compiled_arches),
+    )
+    if required_arch not in compiled_arches:
+        raise RuntimeError(
+            f"Installed PyTorch {torch.__version__} does not include {required_arch} kernels "
+            f"for {torch.cuda.get_device_name(0)}. Install a CUDA 12.8+ PyTorch wheel "
+            "(torch>=2.7, torchvision matching torch) from "
+            "https://download.pytorch.org/whl/cu128."
+        )
+    torch.zeros(1, device="cuda").add_(1)
+    torch.cuda.synchronize()
+
+
+def _load_face_enhancers() -> List[Tuple[str, object]]:
+    """
+    Load whichever restoration model(s) are enabled (ENABLE_GFPGAN /
+    ENABLE_RESTOREFORMER — see config.py for the full truth table), in a
+    fixed order (gfpgan, then restoreformer) matching _ENHANCER_MODELS, so
+    when both are on, _apply_face_enhancers() always chains them the same
+    way: GFPGAN restores first, RestoreFormer refines its output.
+
+    Each model is loaded independently and best-effort: if one fails (e.g. a
+    weights download hiccup) the other can still load and run, so a single
+    bad model degrades to partial rather than zero enhancement. Returns []
+    if nothing is enabled, the `gfpgan` package itself is unavailable, or
+    every enabled model failed to load.
+    """
+    enabled_names = [
+        name
+        for name, flag in (
+            ("gfpgan", settings.enable_gfpgan),
+            ("restoreformer", settings.enable_restoreformer),
+        )
+        if flag
+    ]
+    if not enabled_names:
+        return []
+
     try:
         import torch
 
         _patch_torchvision_functional_tensor()
         from gfpgan import GFPGANer
-
-        device = "cuda" if settings.use_cuda and torch.cuda.is_available() else "cpu"
-        if settings.use_cuda and device == "cpu":
-            logger.warning(
-                "Face enhancer GPU requested but CUDA is unavailable; falling back to CPU."
-            )
-
-        if device == "cuda":
-            major, minor = torch.cuda.get_device_capability(0)
-            required_arch = f"sm_{major}{minor}"
-            compiled_arches = set(torch.cuda.get_arch_list())
-            logger.info(
-                "Enhancer PyTorch=%s, CUDA runtime=%s, GPU=%s (%s), compiled_arches=%s",
-                torch.__version__, torch.version.cuda, torch.cuda.get_device_name(0),
-                required_arch, sorted(compiled_arches),
-            )
-            if required_arch not in compiled_arches:
-                raise RuntimeError(
-                    f"Installed PyTorch {torch.__version__} does not include {required_arch} kernels "
-                    f"for {torch.cuda.get_device_name(0)}. Install a CUDA 12.8+ PyTorch wheel "
-                    "(torch>=2.7, torchvision matching torch) from "
-                    "https://download.pytorch.org/whl/cu128."
-                )
-            # Execute a real kernel now so an incompatible wheel fails once at
-            # startup instead of once per processed video frame.
-            torch.zeros(1, device="cuda").add_(1)
-            torch.cuda.synchronize()
-
-        model_config = _ENHANCER_MODELS[settings.face_enhancer_model]
-        logger.info("Face enhancer model: %s (device=%s)", settings.face_enhancer_model, device)
-
-        return GFPGANer(
-            model_path=model_config["model_path"],
-            upscale=1,
-            arch=model_config["arch"],
-            channel_multiplier=model_config["channel_multiplier"],
-            device=device,
-        )
     except Exception as exc:  # pragma: no cover - enhancer is best-effort
-        logger.warning("Face enhancer unavailable, continuing without it: %s", exc)
-        return None
+        logger.warning("Face enhancer package unavailable, continuing without it: %s", exc)
+        return []
+
+    device = "cuda" if settings.use_cuda and torch.cuda.is_available() else "cpu"
+    if settings.use_cuda and device == "cpu":
+        logger.warning(
+            "Face enhancer GPU requested but CUDA is unavailable; falling back to CPU."
+        )
+
+    if device == "cuda":
+        try:
+            _check_cuda_enhancer_readiness(torch)
+        except Exception as exc:
+            logger.warning("Face enhancer unavailable, continuing without it: %s", exc)
+            return []
+
+    loaded: List[Tuple[str, object]] = []
+    for name in enabled_names:
+        model_config = _ENHANCER_MODELS[name]
+        try:
+            enhancer = GFPGANer(
+                model_path=model_config["model_path"],
+                upscale=1,
+                arch=model_config["arch"],
+                channel_multiplier=model_config["channel_multiplier"],
+                device=device,
+            )
+            loaded.append((name, enhancer))
+            logger.info("Loaded face enhancer: %s (device=%s)", name, device)
+        except Exception as exc:  # pragma: no cover - enhancer is best-effort
+            logger.warning("Face enhancer '%s' unavailable, continuing without it: %s", name, exc)
+
+    return loaded
 
 
 def get_engine():
     """Thread-safe lazy init so the (slow) model load happens once, on first request."""
-    global _face_analyser, _face_swapper, _face_enhancer, _face_enhancer_disabled_reason
+    global _face_analyser, _face_swapper, _face_enhancers, _face_enhancer_disabled_reason
     needs_enhancer = (
         settings.enable_face_enhancer
-        and _face_enhancer is None
+        and _face_enhancers is None
         and _face_enhancer_disabled_reason is None
     )
     if _face_analyser is None or _face_swapper is None or needs_enhancer:
@@ -180,14 +225,22 @@ def get_engine():
                 _face_swapper = _load_face_swapper()
             if (
                 settings.enable_face_enhancer
-                and _face_enhancer is None
+                and _face_enhancers is None
                 and _face_enhancer_disabled_reason is None
             ):
-                logger.info("Loading face enhancer (%s)...", settings.face_enhancer_model)
-                _face_enhancer = _load_face_enhancer()
-                if _face_enhancer is None:
+                enabled_names = [
+                    name
+                    for name, flag in (
+                        ("gfpgan", settings.enable_gfpgan),
+                        ("restoreformer", settings.enable_restoreformer),
+                    )
+                    if flag
+                ]
+                logger.info("Loading face enhancer(s): %s...", ", ".join(enabled_names))
+                _face_enhancers = _load_face_enhancers()
+                if not _face_enhancers:
                     _face_enhancer_disabled_reason = "enhancer initialization failed"
-    return _face_analyser, _face_swapper, _face_enhancer
+    return _face_analyser, _face_swapper, _face_enhancers or []
 
 
 def get_primary_face(analyser, image: np.ndarray, want: str = "largest"):
@@ -415,37 +468,47 @@ def _eye_band_mask(height: int, width: int, kps) -> Optional[np.ndarray]:
     return mask[:, :, None]
 
 
-def _apply_face_enhancer(
-    result: np.ndarray, face_enhancer, target_face: Optional[object]
+def _apply_face_enhancers(
+    result: np.ndarray,
+    face_enhancers: List[Tuple[str, object]],
+    target_face: Optional[object],
 ) -> np.ndarray:
     """
-    Run the configured enhancer (GFPGAN or RestoreFormer — see
-    FACE_ENHANCER_MODEL) and, if enabled, protect the eye/glasses band from
-    its output by blending back toward the pre-enhancement frame.
+    Run each enabled restoration model in turn — see ENABLE_GFPGAN /
+    ENABLE_RESTOREFORMER in config.py. `face_enhancers` is already in chain
+    order (gfpgan, then restoreformer — see _load_face_enhancers()), so when
+    both are enabled, RestoreFormer refines GFPGAN's output rather than the
+    other way around. With only one enabled, this is just that one pass.
+
+    Eye/glasses-band protection (if enabled) is applied once, at the end,
+    relative to the frame as it looked before ANY enhancer ran — not
+    per-stage — so the protection strength doesn't compound when chaining
+    two models.
 
     Note: `weight` only affects GFPGAN's "clean" arch (it blends between
     restored and original in an intermediate style layer specific to that
     architecture). RestoreFormer's forward() accepts and ignores it via
-    **kwargs, so FACE_ENHANCER_WEIGHT is a no-op when
-    FACE_ENHANCER_MODEL=restoreformer — harmless, just not applicable.
+    **kwargs, so FACE_ENHANCER_WEIGHT only has an effect on the GFPGAN stage.
     """
     pre_enhance = result.copy()
-    _, _, enhanced = face_enhancer.enhance(
-        result, has_aligned=False, only_center_face=False, paste_back=True,
-        weight=settings.face_enhancer_weight,
-    )
+    current = result
+    for _name, enhancer in face_enhancers:
+        _, _, current = enhancer.enhance(
+            current, has_aligned=False, only_center_face=False, paste_back=True,
+            weight=settings.face_enhancer_weight,
+        )
 
     if not settings.protect_eyewear_region or target_face is None:
-        return enhanced
+        return current
 
     kps = getattr(target_face, "kps", None)
-    mask = _eye_band_mask(enhanced.shape[0], enhanced.shape[1], kps)
+    mask = _eye_band_mask(current.shape[0], current.shape[1], kps)
     if mask is None:
-        return enhanced
+        return current
 
     protect = mask * settings.eyewear_protection_strength
     blended = (
-        enhanced.astype(np.float32) * (1 - protect) + pre_enhance.astype(np.float32) * protect
+        current.astype(np.float32) * (1 - protect) + pre_enhance.astype(np.float32) * protect
     ).astype(np.uint8)
     return blended
 
@@ -454,7 +517,7 @@ def swap_face_in_frame(
     frame: np.ndarray,
     source_face,
     face_swapper,
-    face_enhancer=None,
+    face_enhancers: Optional[List[Tuple[str, object]]] = None,
     target_face: Optional[object] = None,
 ) -> np.ndarray:
     """
@@ -465,11 +528,13 @@ def swap_face_in_frame(
       - color correction (ENABLE_COLOR_CORRECTION, default on): fixes the
         "pasted on" look by matching the swapped face's lighting/skin tone
         to the frame. See _color_correct_pasted_face() above.
-      - face enhancer (ENABLE_FACE_ENHANCER, default off): GFPGAN sharpening
-        pass, with its restoration strength tunable via FACE_ENHANCER_WEIGHT,
-        and the eye/glasses band optionally protected from GFPGAN's known
-        glasses artifacts via PROTECT_EYEWEAR_REGION /
-        EYEWEAR_PROTECTION_STRENGTH. See _apply_face_enhancer() above.
+      - face enhancer(s) (ENABLE_GFPGAN / ENABLE_RESTOREFORMER, both off by
+        default): one or both restoration passes, chained in that order when
+        both are on, with restoration strength tunable via
+        FACE_ENHANCER_WEIGHT (GFPGAN stage only), and the eye/glasses band
+        optionally protected from known glasses artifacts via
+        PROTECT_EYEWEAR_REGION / EYEWEAR_PROTECTION_STRENGTH. See
+        _apply_face_enhancers() above.
     Both passes are best-effort — if either fails on a given frame, the swap
     still returns rather than crashing the whole job over a cosmetic pass.
     """
@@ -484,16 +549,16 @@ def swap_face_in_frame(
         except Exception as exc:  # pragma: no cover - correction is best-effort
             logger.warning("Color correction failed on a frame, using raw swap: %s", exc)
 
-    if face_enhancer is not None:
+    if face_enhancers:
         try:
-            result = _apply_face_enhancer(result, face_enhancer, target_face)
+            result = _apply_face_enhancers(result, face_enhancers, target_face)
         except Exception as exc:  # pragma: no cover - enhancer is best-effort
-            global _face_enhancer, _face_enhancer_disabled_reason
+            global _face_enhancers, _face_enhancer_disabled_reason
             logger.exception(
-                "Face enhancement failed; disabling enhancer for this worker process "
+                "Face enhancement failed; disabling enhancer(s) for this worker process "
                 "and using raw swaps for remaining frames: %s", exc
             )
-            _face_enhancer = None
+            _face_enhancers = []
             _face_enhancer_disabled_reason = str(exc)
 
     return result

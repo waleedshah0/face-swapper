@@ -1,6 +1,7 @@
 # Optional. Install together with requirements.txt in ONE pip invocation:
 #   pip install -r requirements.txt -r requirements-enhancer.txt
-# Only needed if you set ENABLE_FACE_ENHANCER=true in .env.
+# Only needed if you set ENABLE_GFPGAN=true and/or ENABLE_RESTOREFORMER=true
+# in .env.
 #
 # Installing this file as a SEPARATE `pip install` after requirements.txt
 # will silently upgrade numpy past the <2.0.0 pin in requirements.txt
@@ -17,7 +18,8 @@ numpy>=1.26.0,<2.0.0
 #   1. Run this app's venv on Python 3.10 or 3.11 instead, where basicsr's
 #      old setup.py still works, or
 #   2. Skip the enhancer entirely — app/core/face_engine.py already runs
-#      fine without it (ENABLE_FACE_ENHANCER=false, the default).
+#      fine without it (ENABLE_GFPGAN=false and ENABLE_RESTOREFORMER=false,
+#      both the default).
 gfpgan==1.3.8
 basicsr==1.4.2
 facexlib==0.3.0

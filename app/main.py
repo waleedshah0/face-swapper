@@ -14,6 +14,9 @@ FastAPI service (no frontend) exposing:
       SiteId identifies which site/tenant this job belongs to. It's stored
       alongside the job's status record in Redis and echoed back in every
       API response for this job (POST /api/swap and GET /api/swap/{job_id}).
+      SiteId must be unique among active (non-expired) records — reusing
+      one within REQUEST_RECORD_TTL_SECONDS of its first use gets a 409
+      Conflict response instead of creating a second job under it.
 
       OriginalSource and SwapSource are filenames expected to already exist
       in settings.uploads_dir (the shared folder the website/mobile server
@@ -74,7 +77,7 @@ from fastapi.concurrency import run_in_threadpool
 from app.broker import BrokerError, SwapJobMessage, publish_swap_job
 from app.config import settings
 from app.schemas import SwapAccepted, SwapStatus
-from app.store import STATUS_STARTING, RequestStoreError, get_store
+from app.store import STATUS_STARTING, RequestStoreError, SiteIdConflictError, get_store
 from app.utils import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -173,18 +176,35 @@ async def api_swap(
     site_id, original_name, swap_name, target_name = _parse_swap_request(xml_body)
     media_type = _media_type_for(original_name)
 
+    store = get_store()
+
+    # Fast-path rejection for an obviously-duplicate SiteId, before doing
+    # any file validation work for a request that's going to be rejected
+    # anyway. store.create() below still does the authoritative, race-safe
+    # check (atomic Redis SETNX) — this is just a cheap early exit.
+    try:
+        site_id_taken = await run_in_threadpool(store.site_id_exists, site_id)
+    except RequestStoreError as exc:
+        logger.exception("Status cache unavailable")
+        raise HTTPException(status_code=503, detail="Status cache unavailable. Try again shortly.") from exc
+    if site_id_taken:
+        raise HTTPException(status_code=409, detail=f"SiteId '{site_id}' already exists.")
+
     original_path = _resolve_upload_path(original_name, "OriginalSource")
     face_path = _resolve_upload_path(swap_name, "SwapSource")
     target_path = _resolve_upload_path(target_name, "TargetSource") if target_name else None
     _validate_sources(original_path, face_path, media_type, target_path)
 
     job_id = str(uuid.uuid4())
-    store = get_store()
 
     try:
         await run_in_threadpool(
             store.create, job_id, site_id, original_name, swap_name, media_type, target_name
         )
+    except SiteIdConflictError as exc:
+        # Rare race: another request claimed this SiteId between the check
+        # above and here. This is the authoritative guard (Redis SETNX).
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RequestStoreError as exc:
         logger.exception("Status cache unavailable")
         raise HTTPException(status_code=503, detail="Status cache unavailable. Try again shortly.") from exc
