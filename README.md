@@ -11,11 +11,11 @@ shared uploads folder and just needs the swap done.
 
 ```
 Caller (website/mobile server)
-   │  POST /api/swap  (XML: OriginalSource, SwapSource, optional TargetSource)
+   │  POST /api/swap  (XML: SiteId, OriginalSource, SwapSource, optional TargetSource)
    ▼
 FastAPI (app/main.py)
-   │  validate payload → generate job_id → write status "Starting" to Redis → publish job to RabbitMQ
-   │  responds 202 immediately with {job_id, media_type, status}
+   │  validate payload → generate job_id → write status "Starting" (+ site_id) to Redis → publish job to RabbitMQ
+   │  responds 202 immediately with {job_id, site_id, media_type, status}
    ▼
 RabbitMQ (swap_jobs queue)
    ▼
@@ -24,6 +24,7 @@ Worker process(es) (app/worker.py) — one or more, scale horizontally
    │  app/core/face_engine.py   (InsightFace detector + inswapper_128)
    │  app/core/image_swap.py / app/core/video_swap.py (frame loop + ffmpeg audio mux)
    │  status → "Completed" (+ output_file) or "Failed" (+ message)
+   │  on "Completed": POST the job's record (XML) to this job's per-SiteId webhook URL (best-effort)
    ▼
 Redis (status cache, keyed by job_id)
    ▲
@@ -61,12 +62,13 @@ pip install -r requirements.txt
 ```
 
 If you get a GPU later: change `onnxruntime` to `onnxruntime-gpu` in
-`requirements.txt`, set `EXECUTION_PROVIDER=cuda` in `.env`, and use
-`Dockerfile.gpu` instead of `Dockerfile` (or see "Deploying to a server").
+`requirements.txt` and set `EXECUTION_PROVIDER=cuda` in `.env` — `Dockerfile`
+is already CUDA-based (`nvidia/cuda` base image), so no separate GPU
+Dockerfile is needed; see "Deploying to a server" below.
 
 If you want to run everything on GPU, also install the optional enhancer
-requirements with `pip install -r requirements-enhancer.txt` and keep
-`ENABLE_FACE_ENHANCER=true` in `.env`.
+requirements with `pip install -r requirements-enhancer.txt` and set
+`ENABLE_GFPGAN=true` and/or `ENABLE_RESTOREFORMER=true` in `.env`.
 
 ### What to expect on CPU
 
@@ -76,8 +78,9 @@ requirements with `pip install -r requirements-enhancer.txt` and keep
   frame is typical on a modern laptop CPU, so a 10-second clip at 30fps
   (300 frames) can take 5-15 minutes. Plan accordingly:
   - Test with short clips (a few seconds) first.
-  - `ENABLE_FACE_ENHANCER` defaults to `false` here on purpose — GFPGAN
-    roughly doubles per-frame time on CPU for a quality bump you often
+  - `ENABLE_GFPGAN` and `ENABLE_RESTOREFORMER` both default to `false` here
+    on purpose — each enabled model adds roughly a full extra pass per
+    frame on CPU (two passes if both are on) for a quality bump you often
     won't need for testing.
   - `MAX_VIDEO_MB` already defaults to 50MB in `.env.example` for this
     reason — drop it further if you want a tighter safety margin.
@@ -105,8 +108,9 @@ target — see "Which face gets swapped" below.
 
 If you want the optional face enhancer, install its dependencies first
 (`pip install -r requirements-enhancer.txt` — see the troubleshooting note
-below if that fails to build) and set `ENABLE_FACE_ENHANCER=true`. The
-GFPGAN weights then download automatically on first run.
+below if that fails to build) and set `ENABLE_GFPGAN=true` and/or
+`ENABLE_RESTOREFORMER=true`. The corresponding weights then download
+automatically on first run.
 
 ## 4. Configure
 
@@ -145,6 +149,8 @@ uvicorn app.main:app --reload --port 8000
 python -m app.worker
 ```
 
+docker compose stop rabbitmq redis
+docker compose rm -f rabbitmq redis
 ## Deploying to a server (GPU)
 
 The image is built once and used for **both** the API and the worker — the
@@ -154,8 +160,8 @@ instead of `uvicorn`. Only the worker needs `--gpus`.
 **1. Build and push (same as before):**
 
 ```bash
-docker build -t dev1shayansolutions/faceswapper:v1 .
-docker push dev1shayansolutions/faceswapper:v1
+$ docker build --build-arg INSTALL_ENHANCER=true -t dev1shayansolutions/faceswapper:v9 .
+docker push dev1shayansolutions/faceswapper:v9
 ```
 
 **2. On the server**, create a directory (e.g. `/opt/faceswap-app/`) with
@@ -192,13 +198,18 @@ no GPU), and the worker (with `--gpus`) together, wired to talk to each
 other, with the same `/mnt/gpu/send_to_gpu` / `/mnt/gpu/receive_from_gpu`
 bind mounts your old command used.
 
-**Rolling out a new version:** build + push a new tag as before, then on
-the server:
+**Rolling out a new version:** build + push a new tag, update the `image:`
+line(s) in `docker-compose.prod.yml` on the server to that tag, then:
 
 ```bash
 docker compose -f docker-compose.prod.yml pull
-docker compose -f docker-compose.prod.yml up -d
+docker compose -f docker-compose.prod.yml up -d --force-recreate
 ```
+
+`--force-recreate` guarantees the `api` and `worker` containers are actually
+replaced with the new image even if compose thinks nothing changed (e.g. the
+tag was reused) — cheap insurance against redeploying and still running the
+old code.
 
 **Security note:** `docker-compose.prod.yml` binds RabbitMQ's and Redis's
 ports to `127.0.0.1` only (containers still reach each other over the
@@ -211,8 +222,21 @@ consider changing the default `guest`/`guest` credentials.
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
-| POST | `/api/swap` | `application/xml`: `<SwapRequest><OriginalSource/><SwapSource/><TargetSource/></SwapRequest>` | Validates the payload, generates a `job_id`, queues the job, returns `202` with `{job_id, media_type, status}` immediately. Does not wait for the swap to finish. |
+| POST | `/api/swap` | `application/xml`: `<SwapRequest><SiteId/><OriginalSource/><SwapSource/><TargetSource/></SwapRequest>` | Validates the payload, generates a `job_id`, queues the job, returns `202` with `{job_id, site_id, media_type, status}` immediately. Does not wait for the swap to finish. |
 | GET | `/api/swap/{job_id}` | — | Returns the job's current status as a single JSON response and closes immediately. Not a stream — poll it again whenever you want the next update. |
+
+`SiteId` is a caller-supplied string identifying which site/tenant the job
+belongs to — it's required, stored alongside the job's status record in
+Redis, and echoed back in `site_id` on every response for that job (both
+`POST /api/swap` and `GET /api/swap/{job_id}`).
+
+`SiteId` must be **unique among active (non-expired) records**. If a
+`POST /api/swap` reuses a `SiteId` that still has a live record in Redis
+(i.e. within `REQUEST_RECORD_TTL_SECONDS` of its first use), the request is
+rejected with `409 Conflict` instead of creating a second job under it. The
+`SiteId` frees up again once that record expires. This is enforced
+race-safely (atomic Redis `SETNX`), so two concurrent requests with the same
+`SiteId` can't both slip through — see `app/store.py:RequestStore.create()`.
 
 `OriginalSource`, `SwapSource`, and `TargetSource` are filenames expected to
 already exist in `settings.uploads_dir` (the shared folder the
@@ -228,6 +252,52 @@ there's no caller-supplied id to de-duplicate against, every `POST
 `OriginalSource`/`SwapSource` — retry logic on the caller's side needs to
 account for that (e.g. don't blindly retry on timeout without checking
 whether the first request actually landed).
+
+### Completion webhook
+
+Once a job's status has been written to Redis as `Completed` (100% done),
+`app/worker.py` POSTs that job's just-updated cache record as an **XML**
+body — a `<SwapResponse>` element, mirroring the `<SwapRequest>` XML the
+caller originally POSTed to `/api/swap` — to a URL built from
+`COMPLETION_WEBHOOK_URL_TEMPLATE`. It carries the same fields
+`GET /api/swap/{job_id}` would return, so the receiver doesn't need a
+separate poll to find out what finished.
+
+The URL is **per-SiteId**: `{site_id}` in the template is substituted with
+the job's own `SiteId`. With the default template
+`https://{site_id}.cs4m.com/face_swap/response/`, a job with
+`SiteId=csw102w` gets its webhook posted to
+`https://csw102w.cs4m.com/face_swap/response/`:
+
+```bash
+curl --header "Content-Type: application/xml" \
+  --request POST \
+  --data '<?xml version="1.0" encoding="utf-8"?>
+<SwapResponse><JobId>...</JobId><SiteId>csw102w</SiteId><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource><MediaType>video</MediaType><TargetSource></TargetSource><Status>Completed</Status><Message></Message><OutputFile>....mp4</OutputFile><CreatedAt>...</CreatedAt><UpdatedAt>...</UpdatedAt></SwapResponse>' \
+  https://csw102w.cs4m.com/face_swap/response/
+```
+
+Field-to-tag mapping and empty/missing-value handling (`None` -> empty
+element, e.g. `<TargetSource/>`) live in
+`app/worker.py:_WEBHOOK_XML_TAGS` / `_payload_to_xml()`.
+
+`COMPLETION_WEBHOOK_URL_TEMPLATE` is only ever read from `.env`, so pointing
+at a different domain/pattern is always a `.env` edit, never a code change
+or rebuild. Leave it empty/unset to disable the webhook entirely. `SiteId`
+is sanitized before being substituted into the URL (must match
+`^[A-Za-z0-9-]+$`, since it becomes a hostname component) — if it doesn't
+match, the webhook is skipped for that job (logged as a warning) rather than
+firing a malformed request. See `app/worker.py:_completion_webhook_url_for()`.
+
+This is best-effort (`app/worker.py:_send_completion_webhook()`) — a
+failed or slow webhook is logged as a warning and never affects the job's
+own status, which is already final by that point. It only fires on success
+(`Completed`), not on `Failed`. If the Redis write itself failed (so there's
+no record to send), it falls back to just `<SwapResponse>` with `<JobId>`
+and `<SiteId>` only. The outgoing XML payload is always logged
+(`logger.info`) before the request is sent, regardless of whether it
+succeeds. `COMPLETION_WEBHOOK_TIMEOUT_SECONDS` (default `10`) caps how long
+the worker waits on it.
 
 ### Which face gets swapped (multi-face photos and videos)
 
@@ -269,13 +339,13 @@ Example (`curl`):
 # default target (first female face):
 curl -X POST http://localhost:8000/api/swap \
   -H "Content-Type: application/xml" \
-  -d '<SwapRequest><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource></SwapRequest>'
+  -d '<SwapRequest><SiteId>site123</SiteId><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource></SwapRequest>'
 
 # specific person via TargetSource:
 curl -X POST http://localhost:8000/api/swap \
   -H "Content-Type: application/xml" \
-  -d '<SwapRequest><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource><TargetSource>dipika.jpg</TargetSource></SwapRequest>'
-# -> {"job_id": "...", "media_type": "video", "status": "Starting"}
+  -d '<SwapRequest><SiteId>site123</SiteId><OriginalSource>video1.mp4</OriginalSource><SwapSource>image2.jpg</SwapSource><TargetSource>dipika.jpg</TargetSource></SwapRequest>'
+# -> {"job_id": "...", "site_id": "site123", "media_type": "video", "status": "Starting"}
 
 curl http://localhost:8000/api/swap/<job_id-from-above>
 ```
@@ -284,6 +354,81 @@ Call the `GET` again a few seconds later to see the next update — this is
 plain request/response, not a held-open connection, so a standard HTTP
 client (or Swagger's "Try it out") works fine, unlike a Server-Sent Events
 or WebSocket stream would.
+
+### Improving swap quality
+
+Two independent, best-effort post-processing passes run after the raw
+`inswapper_128` swap, both in `app/core/face_engine.py:swap_face_in_frame()`:
+
+- **Color correction** (`ENABLE_COLOR_CORRECTION`, default `true`) — the raw
+  model pastes the source face's own color/lighting as-is, which is most of
+  why untouched swaps can look "pasted on". This shifts the pasted face's
+  color statistics (in LAB space) to match the frame it landed in, blended
+  back with a feathered mask so the fix doesn't add its own hard edge. No
+  extra model, negligible cost — leave this on.
+- **Face enhancer** — one or two GAN-based restoration passes that
+  sharpen/clean the swapped face. Meaningfully better output, but each
+  enabled model adds roughly a full extra pass per frame on CPU — worth it
+  once you're on GPU (see "Deploying to a server" above), off by default
+  for fast local testing. `ENABLE_GFPGAN` and `ENABLE_RESTOREFORMER` are
+  independent on/off switches (both ship inside the `gfpgan` package
+  already in `requirements-enhancer.txt`, so toggling either is a config
+  change, not a new dependency, and both are Apache 2.0 / commercial-safe)
+  — there's no separate master switch, so whether enhancement runs at all,
+  and which model(s), is entirely decided by these two flags:
+
+  | `ENABLE_GFPGAN` | `ENABLE_RESTOREFORMER` | Result |
+  |---|---|---|
+  | `false` | `false` | No enhancement — raw swap output (the default). |
+  | `true` | `false` | GFPGAN (GFPGANv1.4) only. |
+  | `false` | `true` | RestoreFormer only — generally better identity preservation/detail than GFPGAN alone. |
+  | `true` | `true` | Both, chained: GFPGAN restores first, then RestoreFormer refines its output. Strongest result, slowest (two passes/frame). |
+
+  With `ENABLE_RESTOREFORMER=true`, note `FACE_ENHANCER_WEIGHT` has no
+  effect on that stage (that parameter is specific to GFPGAN's "clean"
+  architecture; RestoreFormer's `enhance()` silently ignores it) — it still
+  affects the GFPGAN stage if `ENABLE_GFPGAN=true` too.
+
+  A note on a commonly-recommended third option, **CodeFormer**: it's
+  generally considered the strongest of the three, especially on
+  occlusions like glasses, but its weights are licensed **non-commercial
+  only** (S-Lab License 1.0 — commercial use requires contacting the
+  authors) and it isn't a properly maintained pip package, so it isn't
+  wired up here. Worth it if this deployment is genuinely non-commercial/
+  internal and you're willing to vendor its architecture code; skip it
+  otherwise.
+
+**Glasses/eyewear look distorted or blurred after enhancement:** this is a
+known GFPGAN limitation — its restoration model is trained mostly on bare
+faces, and lens glare/frame edges commonly get misread as noise and
+"corrected" away. Two settings address it, both on by default when the
+enhancer is enabled:
+
+- `PROTECT_EYEWEAR_REGION` (default `true`) — uses the face's eye
+  landmarks to build a band over the glasses area and blends the
+  enhancer's final output (after both stages, if both are enabled) back
+  toward the pre-enhancement swap result there, so the rest of the face
+  still gets sharpened normally. See
+  `app/core/face_engine.py:_eye_band_mask()` / `_apply_face_enhancers()`.
+- `EYEWEAR_PROTECTION_STRENGTH` (default `0.6`, range `0-1`) — how strongly
+  to protect that band. Raise it toward `1.0` if glasses are still visibly
+  warped; lower it if the eye area now looks noticeably softer than the
+  rest of the enhanced face.
+- `FACE_ENHANCER_WEIGHT` (default `0.5`, range `0-1`) — GFPGAN's own
+  restoration strength, independent of the eyewear band (no effect on the
+  RestoreFormer stage — see the table above). Lowering it (e.g. `0.3`)
+  makes GFPGAN's output closer to the raw swap everywhere, which can help
+  if distortion isn't limited to the eyewear area.
+
+If a swap still looks off after all of the above:
+- **Wrong face picked** — tune `FACE_MATCH_THRESHOLD` (see above).
+- **Blurry/low-detail result** — turn on `ENABLE_GFPGAN` and/or
+  `ENABLE_RESTOREFORMER`, and use a sharp, well-lit, front-facing
+  `SwapSource` photo; output quality is bottlenecked by the source photo's
+  quality as much as by any setting here.
+- **Visible seam/edge around the face** — this is what color correction
+  targets; confirm `ENABLE_COLOR_CORRECTION=true` and it's not being
+  swallowed by a stale `.env`.
 
 ## Performance / scaling notes
 
@@ -345,11 +490,15 @@ not an app bug.
 **`gfpgan`/`basicsr` import error mentioning `torchvision.transforms.functional_tensor`**
 `basicsr==1.4.2` (a GFPGAN dependency) was written against an older
 torchvision and breaks on torchvision releases that removed that module.
-This only affects the *optional* face enhancer — `face_engine.py` already
-catches this and logs a warning instead of crashing, so the app keeps
-working without enhancement. To actually fix it: either install an older
-`torchvision` (`pip install "torchvision<0.17"`) in the same environment,
-or set `ENABLE_FACE_ENHANCER=false` in `.env` and skip it entirely.
+`app/core/face_engine.py:_patch_torchvision_functional_tensor()` works
+around this automatically (aliases the missing module to
+`torchvision.transforms.functional`, which still has everything basicsr
+needs under the same names) — you shouldn't need to do anything for this
+one. If you still see it, you're likely running an older build; rebuild
+and redeploy. Even without the patch, this only affects the *optional*
+face enhancer — `face_engine.py` catches the failure and logs a warning
+instead of crashing, so the app keeps working without enhancement either
+way.
 
 **Model load is slow on every job, not just the first one**
 That means something is re-creating the `FaceAnalysis`/swapper objects
@@ -379,6 +528,40 @@ in `OriginalSource` closely enough per `FACE_MATCH_THRESHOLD`. Try lowering
 is in frame but the pose/lighting/angle differs a lot between
 `TargetSource` and `OriginalSource`.
 
+**Worker crashes mid-job with `PRECONDITION_FAILED - delivery acknowledgement ... timed out`**
+RabbitMQ 3.8+ force-closes a channel if a delivered message isn't acked
+within `consumer_timeout` (default 30 minutes) — this is a broker-side
+safety net, separate from the heartbeat handling described in
+`app/worker.py`'s threading note (the swap itself was still running fine in
+the background thread; it just couldn't ack in time). A CPU video job with
+`ENABLE_GFPGAN=true` and/or `ENABLE_RESTOREFORMER=true` can easily take
+longer than 30 minutes.
+`rabbitmq.conf` (mounted into the `rabbitmq` service in both
+`docker-compose.yml` and `docker-compose.prod.yml`) raises this to 6 hours —
+recreate the `rabbitmq` container after pulling this change
+(`docker compose up -d --force-recreate rabbitmq`) for it to take effect. If
+you're deploying with `docker-compose.prod.yml`, remember to copy
+`rabbitmq.conf` onto the server alongside it.
+
+If jobs are hitting this at all, it's worth checking *why* a job is taking
+that long in the first place — two common causes, both visible in the
+worker's per-frame log lines:
+- **Silent CPU fallback**: if you set `EXECUTION_PROVIDER=cuda` but the log
+  shows `Applied providers: ['CPUExecutionProvider']` and/or "GPU requested
+  but CUDA is unavailable", onnxruntime couldn't load its CUDA provider
+  (commonly a missing/mismatched CUDA/cuDNN DLL — see "GPU not picked up"
+  above) and silently ran the whole job on CPU instead, which is 10-20x
+  slower and the main reason a job would run long enough to hit this
+  timeout at all.
+- **Per-frame time climbing over the course of the job** (e.g. 1s/frame at
+  the start, 15-20s/frame by the middle): consistent with memory pressure
+  on a CPU-only run holding `buffalo_l` + `inswapper_128` + GFPGAN in memory
+  simultaneously. The frame loop now calls `gc.collect()` periodically as
+  cheap insurance (see `GC_EVERY_N_FRAMES` in `app/core/video_swap.py`); if
+  it's still climbing after that, it's genuine system memory pressure —
+  check Task Manager, close other memory-heavy applications, or (biggest
+  lever) turn off `ENABLE_GFPGAN`/`ENABLE_RESTOREFORMER` for video on CPU.
+
 ## Extending this
 
 - **Temporal smoothing for video**: the current implementation swaps each
@@ -397,9 +580,12 @@ is in frame but the pose/lighting/angle differs a lot between
   "bad input, don't retry" from "infra hiccup, retry a few times," wire up
   a dead-letter exchange and have the worker `basic_nack` on infra-type
   errors specifically.
-- **Push instead of poll**: if you'd rather not poll `GET /api/swap/{job_id}`,
-  the natural next step is a webhook — add a `CallbackUrl` to `SwapRequest`
-  and have `app/worker.py` POST status updates to it as they happen.
+- **Push instead of poll**: a per-SiteId completion webhook already fires on
+  every `Completed` job (see "Completion webhook" above). If you want
+  fully per-request callback URLs instead of the `{site_id}`-templated one,
+  or updates on `In progress`/`Failed` too, the natural next step is adding
+  a `CallbackUrl` to `SwapRequest` and having `app/worker.py` POST to that
+  instead of/in addition to the templated URL.
 - **Caller-supplied idempotency key**: if you need retry-safe de-duplication
   again (e.g. a caller-supplied `TransId` that maps to a `job_id`), that's a
   small addition on top of the current job_id-only design — add the field

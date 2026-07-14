@@ -12,6 +12,9 @@ services:
       retries: 5
     volumes:
       - rabbitmq_data:/var/lib/rabbitmq
+      # Raises consumer_timeout so long CPU video jobs don't get their
+      # channel force-closed mid-swap — see rabbitmq.conf.
+      - ./rabbitmq.conf:/etc/rabbitmq/conf.d/20-consumer-timeout.conf:ro
 
   redis:
     image: redis:7-alpine
@@ -64,6 +67,13 @@ services:
     volumes:
       - ./storage:/srv/app/storage
       - ./models:/srv/app/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     # Scale to more than one worker for more swap throughput, e.g.:
     #   docker compose up --scale worker=3
 

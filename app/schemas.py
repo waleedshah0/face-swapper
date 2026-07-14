@@ -7,6 +7,7 @@ class SwapAccepted(BaseModel):
     """Returned immediately by POST /api/swap once the job has been queued in RabbitMQ."""
 
     job_id: str                     # server-generated; the id everything else is tracked under
+    site_id: str                    # caller-supplied; identifies which site/tenant this job belongs to
     media_type: str                 # "image" or "video"
     status: str                     # "Starting"
 
@@ -18,6 +19,7 @@ class SwapStatus(BaseModel):
     """
 
     job_id: str
+    site_id: str
     original_source: str
     swap_source: str
     target_source: Optional[str] = None   # reference photo of the specific person to swap, if given

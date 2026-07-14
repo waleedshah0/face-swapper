@@ -5,10 +5,18 @@ FastAPI service (no frontend) exposing:
       Body: application/xml, e.g.
 
         <SwapRequest>
+          <SiteId>site123</SiteId>
           <OriginalSource>video1.mp4</OriginalSource>
           <SwapSource>image2.jpg</SwapSource>
           <TargetSource>dipika.jpg</TargetSource>   <!-- optional -->
         </SwapRequest>
+
+      SiteId identifies which site/tenant this job belongs to. It's stored
+      alongside the job's status record in Redis and echoed back in every
+      API response for this job (POST /api/swap and GET /api/swap/{job_id}).
+      SiteId must be unique among active (non-expired) records — reusing
+      one within REQUEST_RECORD_TTL_SECONDS of its first use gets a 409
+      Conflict response instead of creating a second job under it.
 
       OriginalSource and SwapSource are filenames expected to already exist
       in settings.uploads_dir (the shared folder the website/mobile server
@@ -69,7 +77,7 @@ from fastapi.concurrency import run_in_threadpool
 from app.broker import BrokerError, SwapJobMessage, publish_swap_job
 from app.config import settings
 from app.schemas import SwapAccepted, SwapStatus
-from app.store import STATUS_STARTING, RequestStoreError, get_store
+from app.store import STATUS_STARTING, RequestStoreError, SiteIdConflictError, get_store
 from app.utils import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
@@ -86,8 +94,8 @@ logger = logging.getLogger("faceswap.main")
 app = FastAPI(title="Face Swap Service API")
 
 
-def _parse_swap_request(xml_body: str) -> Tuple[str, str, Optional[str]]:
-    """Parse and sanity-check the XML payload. Returns (original_source, swap_source, target_source)."""
+def _parse_swap_request(xml_body: str) -> Tuple[str, str, str, Optional[str]]:
+    """Parse and sanity-check the XML payload. Returns (site_id, original_source, swap_source, target_source)."""
     try:
         root = ET.fromstring(xml_body)
     except ET.ParseError as exc:
@@ -99,16 +107,19 @@ def _parse_swap_request(xml_body: str) -> Tuple[str, str, Optional[str]]:
             detail="Invalid XML payload. Root element must be <SwapRequest>.",
         )
 
+    site_id = (root.findtext("SiteId") or "").strip()
     original_source = safe_filename(root.findtext("OriginalSource"))
     swap_source = safe_filename(root.findtext("SwapSource"))
     target_source = safe_filename(root.findtext("TargetSource"))  # optional
 
+    if not site_id:
+        raise HTTPException(status_code=400, detail="Missing SiteId.")
     if not original_source:
         raise HTTPException(status_code=400, detail="Missing OriginalSource.")
     if not swap_source:
         raise HTTPException(status_code=400, detail="Missing SwapSource.")
 
-    return original_source, swap_source, target_source
+    return site_id, original_source, swap_source, target_source
 
 
 def _resolve_upload_path(filename: str, label: str) -> Path:
@@ -155,14 +166,29 @@ async def api_swap(
         ...,
         media_type="application/xml",
         example="""<SwapRequest>
+  <SiteId>site123</SiteId>
   <OriginalSource>video1.mp4</OriginalSource>
   <SwapSource>image2.jpg</SwapSource>
   <TargetSource>dipika.jpg</TargetSource>
 </SwapRequest>""",
     ),
 ):
-    original_name, swap_name, target_name = _parse_swap_request(xml_body)
+    site_id, original_name, swap_name, target_name = _parse_swap_request(xml_body)
     media_type = _media_type_for(original_name)
+
+    store = get_store()
+
+    # Fast-path rejection for an obviously-duplicate SiteId, before doing
+    # any file validation work for a request that's going to be rejected
+    # anyway. store.create() below still does the authoritative, race-safe
+    # check (atomic Redis SETNX) — this is just a cheap early exit.
+    try:
+        site_id_taken = await run_in_threadpool(store.site_id_exists, site_id)
+    except RequestStoreError as exc:
+        logger.exception("Status cache unavailable")
+        raise HTTPException(status_code=503, detail="Status cache unavailable. Try again shortly.") from exc
+    if site_id_taken:
+        raise HTTPException(status_code=409, detail=f"SiteId '{site_id}' already exists.")
 
     original_path = _resolve_upload_path(original_name, "OriginalSource")
     face_path = _resolve_upload_path(swap_name, "SwapSource")
@@ -170,18 +196,22 @@ async def api_swap(
     _validate_sources(original_path, face_path, media_type, target_path)
 
     job_id = str(uuid.uuid4())
-    store = get_store()
 
     try:
         await run_in_threadpool(
-            store.create, job_id, original_name, swap_name, media_type, target_name
+            store.create, job_id, site_id, original_name, swap_name, media_type, target_name
         )
+    except SiteIdConflictError as exc:
+        # Rare race: another request claimed this SiteId between the check
+        # above and here. This is the authoritative guard (Redis SETNX).
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except RequestStoreError as exc:
         logger.exception("Status cache unavailable")
         raise HTTPException(status_code=503, detail="Status cache unavailable. Try again shortly.") from exc
 
     job_message = SwapJobMessage(
         job_id=job_id,
+        site_id=site_id,
         original_source=original_name,
         swap_source=swap_name,
         media_type=media_type,
@@ -199,7 +229,7 @@ async def api_swap(
         )
         raise HTTPException(status_code=503, detail="Could not queue swap job. Try again shortly.") from exc
 
-    return SwapAccepted(job_id=job_id, media_type=media_type, status=STATUS_STARTING)
+    return SwapAccepted(job_id=job_id, site_id=site_id, media_type=media_type, status=STATUS_STARTING)
 
 
 # --------------------------------------------------------------------------- #
